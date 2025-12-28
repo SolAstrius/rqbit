@@ -85,6 +85,8 @@ impl<BufType> TorrentMetaV1<BufType> {
 pub struct TorrentMetaV1Info<BufType> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<BufType>,
+    #[serde(rename = "name.utf-8", default = "none", skip_serializing_if = "Option::is_none")] 
+    pub name_utf8: Option<BufType>,
     pub pieces: BufType,
     #[serde(rename = "piece length")]
     pub piece_length: u32,
@@ -255,8 +257,7 @@ pub struct ValidatedTorrentMetaV1Info<BufType> {
 impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
     pub fn name(&self) -> Option<Cow<'_, str>> {
         self.info
-            .name
-            .as_ref()
+            .name()
             .map(|n| self.encoding.decode(n.as_ref()).0)
             .filter(|n| !n.is_empty())
     }
@@ -304,6 +305,10 @@ impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
 }
 
 impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
+    pub fn name(&self) -> Option<&BufType> {
+        self.name_utf8.as_ref().or(self.name.as_ref())
+    }
+
     pub fn validate(self) -> crate::Result<ValidatedTorrentMetaV1Info<BufType>> {
         let lengths = Lengths::from_torrent(&self)?;
         let encoding = self.detect_encoding();
@@ -371,12 +376,12 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
 
     pub fn detect_encoding(&self) -> &'static Encoding {
         let mut encdetect = chardetng::EncodingDetector::new();
-        if let Some(name) = self.name.as_ref() {
+        if let Some(name) = self.name() {
             encdetect.feed(name.as_ref(), false);
         }
 
         for file in self.files.iter().flat_map(|f| f.iter()) {
-            for component in file.path.iter() {
+            for component in file.path().iter() {
                 encdetect.feed(component.as_ref(), false);
             }
         }
@@ -393,7 +398,7 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
             (Some(length), None) => Ok(Either::Left(once(FileDetails {
                 filename: FileIteratorName {
                     encoding,
-                    data: FileIteratorNameData::Single(self.name.as_ref()),
+                    data: FileIteratorNameData::Single(self.name()),
                 },
                 len: length,
                 attr: self.attr.as_ref(),
@@ -409,7 +414,7 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
                 Ok(Either::Right(files.iter().map(move |f| FileDetails {
                     filename: FileIteratorName {
                         encoding,
-                        data: FileIteratorNameData::Tree(&f.path),
+                        data: FileIteratorNameData::Tree(f.path()),
                     },
                     len: f.length,
                     attr: f.attr.as_ref(),
@@ -430,6 +435,8 @@ const fn none<T>() -> Option<T> {
 pub struct TorrentMetaV1File<BufType> {
     pub length: u64,
     pub path: Vec<BufType>,
+    #[serde(rename = "path.utf-8", default = "none", skip_serializing_if = "Option::is_none")] 
+    pub path_utf8: Option<Vec<BufType>>,
 
     #[serde(default = "none", skip_serializing_if = "Option::is_none")]
     pub attr: Option<BufType>,
@@ -443,6 +450,12 @@ pub struct TorrentMetaV1File<BufType> {
     pub symlink_path: Option<Vec<BufType>>,
 }
 
+impl<BufType: AsRef<[u8]>> TorrentMetaV1File<BufType> {
+    fn path(&self) -> &Vec<BufType> {
+        self.path_utf8.as_ref().unwrap_or(&self.path)
+    }
+}
+
 impl<BufType> CloneToOwned for TorrentMetaV1File<BufType>
 where
     BufType: CloneToOwned,
@@ -453,6 +466,7 @@ where
         TorrentMetaV1File {
             length: self.length,
             path: self.path.clone_to_owned(within_buffer),
+            path_utf8: self.path_utf8.clone_to_owned(within_buffer),
             attr: self.attr.clone_to_owned(within_buffer),
             sha1: self.sha1.clone_to_owned(within_buffer),
             symlink_path: self.symlink_path.clone_to_owned(within_buffer),
@@ -469,6 +483,7 @@ where
     fn clone_to_owned(&self, within_buffer: Option<&Bytes>) -> Self::Target {
         TorrentMetaV1Info {
             name: self.name.clone_to_owned(within_buffer),
+            name_utf8: self.name_utf8.clone_to_owned(within_buffer),
             pieces: self.pieces.clone_to_owned(within_buffer),
             piece_length: self.piece_length,
             length: self.length,
