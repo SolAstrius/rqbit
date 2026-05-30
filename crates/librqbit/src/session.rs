@@ -556,7 +556,17 @@ impl Session {
                 None
             };
 
-            let dht = if opts.disable_dht {
+            // DHT runs over UDP, which a SOCKS5 proxy can't carry. Running it would send
+            // queries directly and leak the real IP, defeating the proxy, so disable it.
+            let proxy_configured = opts
+                .connect
+                .as_ref()
+                .and_then(|s| s.proxy_url.as_ref())
+                .is_some();
+            let dht = if opts.disable_dht || proxy_configured {
+                if proxy_configured && !opts.disable_dht {
+                    warn!("DHT disabled because a SOCKS5 proxy is configured (DHT runs over UDP, which the proxy cannot carry)");
+                }
                 None
             } else {
                 let dht = if opts.disable_dht_persistence {
@@ -687,7 +697,7 @@ impl Session {
 
             let blocklist = if let Some(blocklist_url) = opts.blocklist_url {
                 info!(url = blocklist_url, "loading p2p blocklist");
-                let bl = IpRanges::load_from_url(&blocklist_url)
+                let bl = IpRanges::load_from_url(&reqwest_client, &blocklist_url)
                     .await
                     .with_context(|| format!("error reading blocklist from {blocklist_url}"))?;
                 info!(len = bl.len(), "loaded blocklist");
@@ -698,7 +708,7 @@ impl Session {
 
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
                 info!(url = allowlist_url, "loading p2p allowlist");
-                let al = IpRanges::load_from_url(&allowlist_url)
+                let al = IpRanges::load_from_url(&reqwest_client, &allowlist_url)
                     .await
                     .with_context(|| format!("error reading allowlist from {allowlist_url}"))?;
                 info!(len = al.len(), "loaded allowlist");
@@ -1526,6 +1536,7 @@ impl Session {
             self.announce_port().unwrap_or(4240),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            self.connector.proxy_enabled(),
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {

@@ -207,6 +207,13 @@ impl StreamConnector {
         &self.stats
     }
 
+    /// Whether a SOCKS5 proxy is configured. When true, UDP-based transports
+    /// (DHT, UDP trackers) can't be tunneled and should be disabled to avoid
+    /// leaking the real IP.
+    pub(crate) fn proxy_enabled(&self) -> bool {
+        self.proxy_config.is_some()
+    }
+
     pub async fn connect(
         &self,
         addr: SocketAddr,
