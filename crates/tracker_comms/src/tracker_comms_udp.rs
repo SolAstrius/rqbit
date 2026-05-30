@@ -9,6 +9,8 @@ use std::{
 use anyhow::{Context, bail};
 use librqbit_core::{hash_id::Id20, spawn_utils::spawn_with_cancel};
 use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
+
+use crate::socket::UdpTransport;
 use parking_lot::RwLock;
 use rand::Rng;
 use tokio_util::sync::CancellationToken;
@@ -243,7 +245,7 @@ struct ClientLocked {
 }
 
 struct ClientShared {
-    sock: UdpSocket,
+    sock: Box<dyn UdpTransport>,
     locked: RwLock<ClientLocked>,
 }
 
@@ -268,16 +270,23 @@ impl UdpTrackerClient {
     pub async fn new(
         cancel_token: CancellationToken,
         bind_device: Option<&BindDevice>,
+        socket: Option<Box<dyn UdpTransport>>,
     ) -> anyhow::Result<Self> {
-        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-        let sock = UdpSocket::bind_udp(
-            addr,
-            librqbit_dualstack_sockets::BindOpts {
-                device: bind_device,
-                ..Default::default()
-            },
-        )
-        .with_context(|| format!("error creating UDP socket at {addr}"))?;
+        let sock: Box<dyn UdpTransport> = match socket {
+            Some(sock) => sock,
+            None => {
+                let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+                let sock = UdpSocket::bind_udp(
+                    addr,
+                    librqbit_dualstack_sockets::BindOpts {
+                        device: bind_device,
+                        ..Default::default()
+                    },
+                )
+                .with_context(|| format!("error creating UDP socket at {addr}"))?;
+                Box::new(sock)
+            }
+        };
 
         let client = Self {
             state: Arc::new(ClientShared {

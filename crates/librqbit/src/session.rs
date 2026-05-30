@@ -119,6 +119,9 @@ pub struct Session {
     pub(crate) connector: Arc<StreamConnector>,
     reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
+    // When set, udp:// trackers are skipped (a proxy is configured but UDP-over-SOCKS5
+    // couldn't be established, so using them would leak the real IP).
+    skip_udp_trackers: bool,
     disable_trackers: bool,
 
     // Lifecycle management
@@ -556,40 +559,66 @@ impl Session {
                 None
             };
 
-            // DHT runs over UDP, which a SOCKS5 proxy can't carry. Running it would send
-            // queries directly and leak the real IP, defeating the proxy, so disable it.
-            let proxy_configured = opts
+            let proxy_url: Option<String> = opts
                 .connect
                 .as_ref()
-                .and_then(|s| s.proxy_url.as_ref())
-                .is_some();
-            let dht = if opts.disable_dht || proxy_configured {
-                if proxy_configured && !opts.disable_dht {
-                    warn!("DHT disabled because a SOCKS5 proxy is configured (DHT runs over UDP, which the proxy cannot carry)");
-                }
+                .and_then(|s| s.proxy_url.clone());
+            let proxy_config = match proxy_url.as_ref() {
+                Some(pu) => Some(
+                    SocksProxyConfig::parse(pu)
+                        .with_context(|| format!("error parsing proxy url {pu}"))?,
+                ),
+                None => None,
+            };
+
+            let dht = if opts.disable_dht {
                 None
             } else {
-                let dht = if opts.disable_dht_persistence {
-                    DhtBuilder::with_config(DhtConfig {
-                        bootstrap_addrs: opts.dht_bootstrap_addrs.clone(),
-                        cancellation_token: Some(token.child_token()),
-                        bind_device: bind_device.as_ref(),
-                        ..Default::default()
-                    })
-                    .await
-                    .context("error initializing DHT")?
-                } else {
-                    let pdht_config = opts.dht_config.take().unwrap_or_default();
-                    PersistentDht::create(
-                        Some(pdht_config),
-                        Some(token.clone()),
-                        bind_device.as_ref(),
-                    )
-                    .await
-                    .context("error initializing persistent DHT")?
+                // DHT runs over UDP. With a SOCKS5 proxy configured, tunnel it through a
+                // UDP ASSOCIATE so we don't leak the real IP. If the proxy can't do UDP,
+                // disable DHT entirely rather than sending queries directly.
+                let injected_socket: Option<Box<dyn dht::DhtSocket>> = match proxy_config.as_ref()
+                {
+                    Some(proxy) => match proxy.udp_associate(bind_device.as_ref()).await {
+                        Ok(sock) => Some(Box::new(sock)),
+                        Err(e) => {
+                            warn!(
+                                "disabling DHT: couldn't establish UDP-over-SOCKS5 association: {e:#}"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
                 };
 
-                Some(dht)
+                if proxy_config.is_some() && injected_socket.is_none() {
+                    // Proxy set but UDP association failed - skip DHT.
+                    None
+                } else {
+                    let dht = if opts.disable_dht_persistence {
+                        DhtBuilder::with_config(DhtConfig {
+                            bootstrap_addrs: opts.dht_bootstrap_addrs.clone(),
+                            cancellation_token: Some(token.child_token()),
+                            bind_device: bind_device.as_ref(),
+                            socket: injected_socket,
+                            ..Default::default()
+                        })
+                        .await
+                        .context("error initializing DHT")?
+                    } else {
+                        let pdht_config = opts.dht_config.take().unwrap_or_default();
+                        PersistentDht::create(
+                            Some(pdht_config),
+                            Some(token.clone()),
+                            bind_device.as_ref(),
+                            injected_socket,
+                        )
+                        .await
+                        .context("error initializing persistent DHT")?
+                    };
+
+                    Some(dht)
+                }
             };
             let peer_opts = opts
                 .connect
@@ -649,15 +678,6 @@ impl Session {
                 .await
                 .context("error initializing session persistence store")?;
 
-            let proxy_url = opts.connect.as_ref().and_then(|s| s.proxy_url.as_ref());
-            let proxy_config = match proxy_url {
-                Some(pu) => Some(
-                    SocksProxyConfig::parse(pu)
-                        .with_context(|| format!("error parsing proxy url {pu}"))?,
-                ),
-                None => None,
-            };
-
             let client_name_and_version = opts
                 .client_name_and_version
                 .unwrap_or_else(|| crate::client_name_and_version().to_owned());
@@ -686,7 +706,7 @@ impl Session {
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
-                    socks_proxy_config: proxy_config,
+                    socks_proxy_config: proxy_config.clone(),
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
@@ -717,9 +737,27 @@ impl Session {
                 None
             };
 
-            let udp_tracker_client = UdpTrackerClient::new(token.clone(), bind_device.as_ref())
-                .await
-                .context("error creating UDP tracker client")?;
+            // UDP trackers also run over UDP. Tunnel them through SOCKS5 UDP ASSOCIATE
+            // when a proxy is set; if that fails, skip udp:// trackers entirely (the
+            // udp client still binds a direct socket, but `skip_udp_trackers` keeps any
+            // udp:// announce from being attempted, avoiding an IP leak).
+            let (udp_tracker_socket, skip_udp_trackers) = match proxy_config.as_ref() {
+                Some(proxy) => match proxy.udp_associate(bind_device.as_ref()).await {
+                    Ok(sock) => (Some(Box::new(sock) as Box<dyn tracker_comms::UdpTransport>), false),
+                    Err(e) => {
+                        warn!(
+                            "skipping UDP trackers: couldn't establish UDP-over-SOCKS5 association: {e:#}"
+                        );
+                        (None, true)
+                    }
+                },
+                None => (None, false),
+            };
+
+            let udp_tracker_client =
+                UdpTrackerClient::new(token.clone(), bind_device.as_ref(), udp_tracker_socket)
+                    .await
+                    .context("error creating UDP tracker client")?;
 
             let lsd = {
                 if opts.disable_local_service_discovery {
@@ -759,6 +797,7 @@ impl Session {
                     opts.concurrent_init_limit.unwrap_or(3),
                 )),
                 udp_tracker_client,
+                skip_udp_trackers,
                 ratelimits: Limits::new(opts.ratelimits),
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
@@ -1536,7 +1575,7 @@ impl Session {
             self.announce_port().unwrap_or(4240),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
-            self.connector.proxy_enabled(),
+            self.skip_udp_trackers,
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {

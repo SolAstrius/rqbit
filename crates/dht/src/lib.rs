@@ -4,6 +4,7 @@ mod error;
 mod peer_store;
 mod persistence;
 mod routing_table;
+mod socket;
 mod utils;
 
 use std::sync::Arc;
@@ -13,6 +14,7 @@ pub use error::{Error, Result};
 
 pub use crate::dht::DhtStats;
 pub use crate::dht::{DhtConfig, DhtState, RequestPeersStream};
+pub use crate::socket::DhtSocket;
 pub use librqbit_core::hash_id::Id20;
 pub use persistence::{PersistentDht, PersistentDhtConfig};
 

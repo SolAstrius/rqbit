@@ -149,16 +149,18 @@ impl TrackerComms {
         announce_port: u16,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
-        // When a SOCKS5 proxy is configured, UDP trackers can't be tunneled and
-        // would leak the real IP, so they are skipped.
-        proxy_enabled: bool,
+        // Set when UDP trackers must be skipped - i.e. a SOCKS5 proxy is
+        // configured but UDP-over-SOCKS couldn't be established, so using UDP
+        // trackers would leak the real IP. When UDP-over-SOCKS works, the udp
+        // client is already proxied and this stays false.
+        skip_udp_trackers: bool,
     ) -> Option<BoxStream<'static, SocketAddr>> {
         let trackers = trackers
             .into_iter()
             .filter_map(|t| match t.scheme() {
                 "http" | "https" => Some(SupportedTracker::Http(t)),
-                "udp" if proxy_enabled => {
-                    debug!("skipping UDP tracker {t} because a SOCKS5 proxy is configured");
+                "udp" if skip_udp_trackers => {
+                    debug!("skipping UDP tracker {t}: UDP-over-SOCKS5 unavailable");
                     None
                 }
                 "udp" => Some(SupportedTracker::Udp(t)),

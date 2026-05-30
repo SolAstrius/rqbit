@@ -1,6 +1,13 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, bail};
+use fast_socks5::client::Socks5Datagram;
+use fast_socks5::util::target_addr::TargetAddr;
+use futures::future::BoxFuture;
 use librqbit_dualstack_sockets::ConnectOpts;
 use librqbit_utp::{BindDevice, UtpSocketUdp};
 use serde::Serialize;
@@ -85,28 +92,175 @@ impl SocksProxyConfig {
         })
     }
 
+    async fn resolve_proxy_addr(&self) -> Result<SocketAddr> {
+        tokio::net::lookup_host((self.host.as_str(), self.port))
+            .await
+            .map_err(|e| {
+                Error::Anyhow(anyhow::anyhow!(
+                    "error resolving proxy address {}:{}: {e:#}",
+                    self.host,
+                    self.port
+                ))
+            })?
+            .next()
+            .ok_or_else(|| {
+                Error::Anyhow(anyhow::anyhow!(
+                    "proxy address {}:{} resolved to no addresses",
+                    self.host,
+                    self.port
+                ))
+            })
+    }
+
+    // Connect a TCP stream to the proxy itself. Unlike tokio-socks' own
+    // connect(), this goes through dualstack sockets so it honors bind_device.
+    async fn connect_to_proxy_tcp(
+        &self,
+        bind_device: Option<&BindDevice>,
+    ) -> Result<(SocketAddr, tokio::net::TcpStream)> {
+        let proxy_addr = self.resolve_proxy_addr().await?;
+        let tcp = librqbit_dualstack_sockets::tcp_connect(
+            proxy_addr,
+            ConnectOpts {
+                source_port: None,
+                bind_device,
+            },
+        )
+        .await
+        .map_err(Error::TcpConnect)?;
+        Ok((proxy_addr, tcp))
+    }
+
     async fn connect(
         &self,
         addr: SocketAddr,
-    ) -> tokio_socks::Result<(
+        bind_device: Option<&BindDevice>,
+    ) -> Result<(
         impl tokio::io::AsyncRead + Unpin + 'static,
         impl tokio::io::AsyncWrite + Unpin + 'static,
     )> {
-        let proxy_addr = (self.host.as_str(), self.port);
+        let (_, tcp) = self.connect_to_proxy_tcp(bind_device).await?;
 
         let stream = if let Some((username, password)) = self.username_password.as_ref() {
-            tokio_socks::tcp::Socks5Stream::connect_with_password(
-                proxy_addr,
+            tokio_socks::tcp::Socks5Stream::connect_with_password_and_socket(
+                tcp,
                 addr,
                 username.as_str(),
                 password.as_str(),
             )
             .await?
         } else {
-            tokio_socks::tcp::Socks5Stream::connect(proxy_addr, addr).await?
+            tokio_socks::tcp::Socks5Stream::connect_with_socket(tcp, addr).await?
         };
 
         Ok(tokio::io::split(stream))
+    }
+
+    // Establish a SOCKS5 UDP association for tunneling datagrams (DHT, UDP
+    // trackers) through the proxy. Each association owns its TCP control
+    // connection, so callers needing independent receive demuxing (DHT vs. UDP
+    // trackers) should create one each.
+    pub(crate) async fn udp_associate(
+        &self,
+        bind_device: Option<&BindDevice>,
+    ) -> Result<SocksUdpSocket> {
+        let (proxy_addr, tcp) = self.connect_to_proxy_tcp(bind_device).await?;
+        let local_bind: SocketAddr = if proxy_addr.is_ipv6() {
+            (Ipv6Addr::UNSPECIFIED, 0).into()
+        } else {
+            (Ipv4Addr::UNSPECIFIED, 0).into()
+        };
+        let inner = if let Some((username, password)) = self.username_password.as_ref() {
+            Socks5Datagram::bind_with_password(tcp, local_bind, username, password).await
+        } else {
+            Socks5Datagram::bind(tcp, local_bind).await
+        }
+        .map_err(|e| {
+            Error::Anyhow(anyhow::anyhow!(
+                "error establishing SOCKS5 UDP association: {e:#}"
+            ))
+        })?;
+        let bind_addr = inner.get_ref().local_addr().map_err(|e| {
+            Error::Anyhow(anyhow::anyhow!(
+                "error getting local UDP socket address: {e:#}"
+            ))
+        })?;
+        Ok(SocksUdpSocket { inner, bind_addr })
+    }
+}
+
+/// A UDP socket whose datagrams are relayed through a SOCKS5 proxy via UDP
+/// ASSOCIATE. Implements the leaf-crate socket traits so it can be injected into
+/// the DHT and the UDP tracker client, keeping them unaware of SOCKS.
+pub(crate) struct SocksUdpSocket {
+    inner: Socks5Datagram<tokio::net::TcpStream>,
+    bind_addr: SocketAddr,
+}
+
+fn socks_err_to_io(e: fast_socks5::SocksError) -> std::io::Error {
+    std::io::Error::other(e)
+}
+
+fn target_addr_to_socket_addr(ta: TargetAddr) -> std::io::Result<SocketAddr> {
+    match ta {
+        TargetAddr::Ip(sa) => Ok(sa),
+        TargetAddr::Domain(host, port) => Err(std::io::Error::other(format!(
+            "unexpected domain target address from SOCKS5 UDP relay: {host}:{port}"
+        ))),
+    }
+}
+
+impl dht::DhtSocket for SocksUdpSocket {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> BoxFuture<'a, std::io::Result<usize>> {
+        Box::pin(async move {
+            self.inner
+                .send_to(buf, target)
+                .await
+                .map_err(socks_err_to_io)
+        })
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, std::io::Result<(usize, SocketAddr)>> {
+        Box::pin(async move {
+            let (n, ta) = self.inner.recv_from(buf).await.map_err(socks_err_to_io)?;
+            Ok((n, target_addr_to_socket_addr(ta)?))
+        })
+    }
+
+    fn bind_addr(&self) -> SocketAddr {
+        self.bind_addr
+    }
+}
+
+impl tracker_comms::UdpTransport for SocksUdpSocket {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> BoxFuture<'a, std::io::Result<usize>> {
+        Box::pin(async move {
+            self.inner
+                .send_to(buf, target)
+                .await
+                .map_err(socks_err_to_io)
+        })
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, std::io::Result<(usize, SocketAddr)>> {
+        Box::pin(async move {
+            let (n, ta) = self.inner.recv_from(buf).await.map_err(socks_err_to_io)?;
+            Ok((n, target_addr_to_socket_addr(ta)?))
+        })
     }
 }
 
@@ -207,13 +361,6 @@ impl StreamConnector {
         &self.stats
     }
 
-    /// Whether a SOCKS5 proxy is configured. When true, UDP-based transports
-    /// (DHT, UDP trackers) can't be tunneled and should be disabled to avoid
-    /// leaking the real IP.
-    pub(crate) fn proxy_enabled(&self) -> bool {
-        self.proxy_config.is_some()
-    }
-
     pub async fn connect(
         &self,
         addr: SocketAddr,
@@ -234,7 +381,11 @@ impl StreamConnector {
 
         if let Some(proxy) = self.proxy_config.as_ref() {
             let (r, w) = self
-                .with_stat(ConnectionKind::Socks, addr.is_ipv6(), proxy.connect(addr))
+                .with_stat(
+                    ConnectionKind::Socks,
+                    addr.is_ipv6(),
+                    proxy.connect(addr, self.bind_device.as_ref()),
+                )
                 .await?;
             debug!(?addr, "connected through SOCKS5");
             return Ok((

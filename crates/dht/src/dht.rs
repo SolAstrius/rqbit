@@ -18,6 +18,7 @@ use crate::{
     },
     peer_store::PeerStore,
     routing_table::{InsertResult, NodeStatus, RoutingTable},
+    socket::DhtSocket,
 };
 use backon::{ExponentialBuilder, Retryable};
 use bencode::ByteBufOwned;
@@ -965,7 +966,7 @@ impl core::fmt::Debug for ResponseOrError {
 }
 
 struct DhtWorker {
-    socket: UdpSocket,
+    socket: Box<dyn DhtSocket>,
     dht: Arc<DhtState>,
 }
 
@@ -1147,7 +1148,7 @@ impl DhtWorker {
 
     async fn framer(
         &self,
-        socket: &UdpSocket,
+        socket: &dyn DhtSocket,
         mut input_rx: UnboundedReceiver<WorkerSendRequest>,
         output_tx: Sender<(Message<ByteBufOwned>, SocketAddr)>,
     ) -> crate::Result<()> {
@@ -1207,7 +1208,7 @@ impl DhtWorker {
     ) -> crate::Result<()> {
         let (out_tx, mut out_rx) = channel(1);
         let framer = self
-            .framer(&self.socket, in_rx, out_tx)
+            .framer(self.socket.as_ref(), in_rx, out_tx)
             .instrument(debug_span!("dht_framer"));
 
         let bootstrap = self.bootstrap(bootstrap_addrs);
@@ -1283,6 +1284,11 @@ pub struct DhtConfig<'a> {
     pub peer_store: Option<PeerStore>,
     pub cancellation_token: Option<CancellationToken>,
     pub bind_device: Option<&'a BindDevice>,
+    /// A custom socket to send/receive DHT packets through. When set, the DHT
+    /// uses it instead of binding its own dual-stack UDP socket - this is how a
+    /// SOCKS5-proxied transport gets injected. `listen_addr`/`bind_device` are
+    /// ignored in that case (the provided socket is already bound).
+    pub socket: Option<Box<dyn DhtSocket>>,
 }
 
 impl DhtState {
@@ -1296,18 +1302,24 @@ impl DhtState {
     #[inline(never)]
     pub fn with_config<'a>(mut config: DhtConfig<'a>) -> BoxFuture<'a, crate::Result<Arc<Self>>> {
         async move {
-            let addr = config
-                .listen_addr
-                .unwrap_or((Ipv6Addr::UNSPECIFIED, 0).into());
-            let socket = UdpSocket::bind_udp(
-                addr,
-                librqbit_dualstack_sockets::BindOpts {
-                    request_dualstack: true,
-                    reuseport: false,
-                    device: config.bind_device,
-                },
-            )
-            .map_err(|e| Error::Bind(Box::new(e)))?;
+            let socket: Box<dyn DhtSocket> = match config.socket.take() {
+                Some(socket) => socket,
+                None => {
+                    let addr = config
+                        .listen_addr
+                        .unwrap_or((Ipv6Addr::UNSPECIFIED, 0).into());
+                    let socket = UdpSocket::bind_udp(
+                        addr,
+                        librqbit_dualstack_sockets::BindOpts {
+                            request_dualstack: true,
+                            reuseport: false,
+                            device: config.bind_device,
+                        },
+                    )
+                    .map_err(|e| Error::Bind(Box::new(e)))?;
+                    Box::new(socket)
+                }
+            };
 
             let listen_addr = socket.bind_addr();
             info!("DHT listening on {:?}", listen_addr);

@@ -18,7 +18,7 @@ use tracing::{debug_span, error, info, trace, warn};
 
 use crate::peer_store::PeerStore;
 use crate::routing_table::RoutingTable;
-use crate::{Dht, DhtConfig, DhtState};
+use crate::{Dht, DhtConfig, DhtSocket, DhtState};
 
 #[derive(Default)]
 pub struct PersistentDhtConfig {
@@ -88,6 +88,7 @@ impl PersistentDht {
         config: Option<PersistentDhtConfig>,
         cancellation_token: Option<CancellationToken>,
         bind_device: Option<&'a BindDevice>,
+        socket: Option<Box<dyn DhtSocket>>,
     ) -> BoxFuture<'a, anyhow::Result<Dht>> {
         async move {
             let mut config = config.unwrap_or_default();
@@ -166,6 +167,7 @@ impl PersistentDht {
                 peer_store,
                 cancellation_token,
                 bind_device,
+                socket,
                 ..Default::default()
             };
             let dht = DhtState::with_config(dht_config).await?;
