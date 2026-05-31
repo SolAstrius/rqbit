@@ -11,7 +11,7 @@ use futures::future::BoxFuture;
 use librqbit_dualstack_sockets::ConnectOpts;
 use librqbit_utp::{BindDevice, UtpSocketUdp};
 use serde::Serialize;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::{
     Error, PeerConnectionOptions, Result,
@@ -156,14 +156,14 @@ impl SocksProxyConfig {
         Ok(tokio::io::split(stream))
     }
 
-    // Establish a SOCKS5 UDP association for tunneling datagrams (DHT, UDP
-    // trackers) through the proxy. Each association owns its TCP control
-    // connection, so callers needing independent receive demuxing (DHT vs. UDP
-    // trackers) should create one each.
-    pub(crate) async fn udp_associate(
+    // Establish one SOCKS5 UDP association: connect the TCP control channel and
+    // bind the relayed datagram socket. Returns the datagram plus the local UDP
+    // bind address. Used both for the initial association and for transparent
+    // re-association when the relay dies.
+    async fn bind_udp_datagram(
         &self,
         bind_device: Option<&BindDevice>,
-    ) -> Result<SocksUdpSocket> {
+    ) -> Result<(Socks5Datagram<tokio::net::TcpStream>, SocketAddr)> {
         let (proxy_addr, tcp) = self.connect_to_proxy_tcp(bind_device).await?;
         let local_bind: SocketAddr = if proxy_addr.is_ipv6() {
             (Ipv6Addr::UNSPECIFIED, 0).into()
@@ -185,17 +185,60 @@ impl SocksProxyConfig {
                 "error getting local UDP socket address: {e:#}"
             ))
         })?;
-        Ok(SocksUdpSocket { inner, bind_addr })
+        Ok((inner, bind_addr))
+    }
+
+    // Establish a SOCKS5 UDP association for tunneling datagrams (DHT, UDP
+    // trackers) through the proxy. The returned socket is self-healing: a SOCKS5
+    // UDP association lives only as long as its TCP control connection and the
+    // proxy/NAT relay mapping, so when that dies (sends erroring, or no datagrams
+    // arriving despite outstanding sends) [`SocksUdpSocket`] transparently
+    // rebuilds it instead of going deaf for the rest of the process lifetime.
+    //
+    // Each association owns its TCP control connection, so callers needing
+    // independent receive demuxing (DHT vs. UDP trackers) should create one each.
+    pub(crate) async fn udp_associate(
+        &self,
+        bind_device: Option<&BindDevice>,
+    ) -> Result<SocksUdpSocket> {
+        let (inner, bind_addr) = self.bind_udp_datagram(bind_device).await?;
+        Ok(SocksUdpSocket {
+            proxy: self.clone(),
+            bind_device: bind_device.cloned(),
+            inner: tokio::sync::RwLock::new(inner),
+            bind_addr,
+            sent_since_recv: std::sync::atomic::AtomicBool::new(false),
+            reassociating: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 }
 
 /// A UDP socket whose datagrams are relayed through a SOCKS5 proxy via UDP
 /// ASSOCIATE. Implements the leaf-crate socket traits so it can be injected into
 /// the DHT and the UDP tracker client, keeping them unaware of SOCKS.
+///
+/// The association is supervised and self-healing: a SOCKS5 UDP association is
+/// only alive while its TCP control connection and the proxy/NAT relay mapping
+/// are, so when that dies this rebuilds it transparently. Without this, the DHT
+/// learns a handful of nodes at startup and then goes permanently deaf once the
+/// initial association lapses (`recv_from` parks forever, routing table frozen).
 pub(crate) struct SocksUdpSocket {
-    inner: Socks5Datagram<tokio::net::TcpStream>,
+    proxy: SocksProxyConfig,
+    bind_device: Option<BindDevice>,
+    inner: tokio::sync::RwLock<Socks5Datagram<tokio::net::TcpStream>>,
     bind_addr: SocketAddr,
+    // Set on send, cleared on receive. If a recv idles out while this is set, we
+    // sent into the void and the relay is presumed dead.
+    sent_since_recv: std::sync::atomic::AtomicBool,
+    // Ensures only one reassociation runs at a time across the send/recv paths.
+    reassociating: std::sync::atomic::AtomicBool,
 }
+
+// If no datagram arrives within this window while a send is outstanding, assume
+// the SOCKS5 UDP relay died and rebuild the association.
+const SOCKS_UDP_RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+// Backoff after a failed reassociation attempt, so we don't spin on a down proxy.
+const SOCKS_REASSOCIATE_BACKOFF: Duration = Duration::from_secs(5);
 
 fn socks_err_to_io(e: fast_socks5::SocksError) -> std::io::Error {
     std::io::Error::other(e)
@@ -210,28 +253,101 @@ fn target_addr_to_socket_addr(ta: TargetAddr) -> std::io::Result<SocketAddr> {
     }
 }
 
+impl SocksUdpSocket {
+    // Rebuild the SOCKS5 UDP association in place. De-duplicated so concurrent
+    // triggers from the send and recv paths don't stack up rebuilds.
+    async fn reassociate(&self, reason: &str) {
+        use std::sync::atomic::Ordering;
+        if self
+            .reassociating
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        match self
+            .proxy
+            .bind_udp_datagram(self.bind_device.as_ref())
+            .await
+        {
+            Ok((dgram, _)) => {
+                *self.inner.write().await = dgram;
+                self.sent_since_recv.store(false, Ordering::Relaxed);
+                info!(reason, "re-established SOCKS5 UDP association");
+            }
+            Err(e) => {
+                warn!(
+                    reason,
+                    "failed to re-establish SOCKS5 UDP association: {e:#}"
+                );
+                tokio::time::sleep(SOCKS_REASSOCIATE_BACKOFF).await;
+            }
+        }
+        self.reassociating.store(false, Ordering::Release);
+    }
+
+    async fn do_send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        use std::sync::atomic::Ordering;
+        let res = {
+            let g = self.inner.read().await;
+            g.send_to(buf, target).await
+        };
+        match res {
+            Ok(n) => {
+                self.sent_since_recv.store(true, Ordering::Relaxed);
+                Ok(n)
+            }
+            Err(e) => {
+                self.reassociate("send error").await;
+                Err(socks_err_to_io(e))
+            }
+        }
+    }
+
+    async fn do_recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        use std::sync::atomic::Ordering;
+        loop {
+            let timed = {
+                let g = self.inner.read().await;
+                tokio::time::timeout(SOCKS_UDP_RECV_IDLE_TIMEOUT, g.recv_from(buf)).await
+            };
+            match timed {
+                Ok(Ok((n, ta))) => {
+                    self.sent_since_recv.store(false, Ordering::Relaxed);
+                    return Ok((n, target_addr_to_socket_addr(ta)?));
+                }
+                Ok(Err(e)) => {
+                    debug!("error receiving from SOCKS5 UDP relay: {e:#}");
+                    self.reassociate("recv error").await;
+                }
+                Err(_elapsed) => {
+                    // Idle timeout. If we sent without hearing anything back, the
+                    // relay is presumed dead and we rebuild it. Otherwise it's just
+                    // a quiet period: keep waiting (we never surface this as an
+                    // error, since callers treat a recv error as fatal).
+                    if self.sent_since_recv.swap(false, Ordering::Relaxed) {
+                        self.reassociate("recv idle after send").await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl dht::DhtSocket for SocksUdpSocket {
     fn send_to<'a>(
         &'a self,
         buf: &'a [u8],
         target: SocketAddr,
     ) -> BoxFuture<'a, std::io::Result<usize>> {
-        Box::pin(async move {
-            self.inner
-                .send_to(buf, target)
-                .await
-                .map_err(socks_err_to_io)
-        })
+        Box::pin(self.do_send_to(buf, target))
     }
 
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, std::io::Result<(usize, SocketAddr)>> {
-        Box::pin(async move {
-            let (n, ta) = self.inner.recv_from(buf).await.map_err(socks_err_to_io)?;
-            Ok((n, target_addr_to_socket_addr(ta)?))
-        })
+        Box::pin(self.do_recv_from(buf))
     }
 
     fn bind_addr(&self) -> SocketAddr {
@@ -245,22 +361,14 @@ impl tracker_comms::UdpTransport for SocksUdpSocket {
         buf: &'a [u8],
         target: SocketAddr,
     ) -> BoxFuture<'a, std::io::Result<usize>> {
-        Box::pin(async move {
-            self.inner
-                .send_to(buf, target)
-                .await
-                .map_err(socks_err_to_io)
-        })
+        Box::pin(self.do_send_to(buf, target))
     }
 
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, std::io::Result<(usize, SocketAddr)>> {
-        Box::pin(async move {
-            let (n, ta) = self.inner.recv_from(buf).await.map_err(socks_err_to_io)?;
-            Ok((n, target_addr_to_socket_addr(ta)?))
-        })
+        Box::pin(self.do_recv_from(buf))
     }
 }
 
