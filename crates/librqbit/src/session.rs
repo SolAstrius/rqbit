@@ -865,40 +865,60 @@ impl Session {
                 }
             }
 
-            if let Some(persistence) = session.persistence.as_ref() {
-                info!("will use {persistence:?} for session persistence");
+            // Load persisted torrents in the background so session creation (and
+            // therefore the HTTP API listener, which starts after it) doesn't block
+            // until every torrent has been re-checked. With many torrents on slow
+            // storage that reload can take minutes; doing it inline made the API
+            // unreachable (502) for the whole window. Torrents now populate as they
+            // load.
+            if session.persistence.is_some() {
+                session.spawn(
+                    debug_span!(parent: session.rs(), "load_persisted_torrents"),
+                    "load_persisted_torrents",
+                    {
+                        let session = session.clone();
+                        async move {
+                            let persistence = session
+                                .persistence
+                                .as_ref()
+                                .context("bug: persistence missing")?;
+                            info!("will use {persistence:?} for session persistence");
 
-                let mut ps = persistence.stream_all().await?;
-                let mut added_all = false;
-                let mut futs = FuturesUnordered::new();
+                            let mut ps = persistence.stream_all().await?;
+                            let mut added_all = false;
+                            let mut futs = FuturesUnordered::new();
 
-                while !added_all || !futs.is_empty() {
-                    // NOTE: this closure exists purely to workaround rustfmt screwing up when inlining it.
-                    let add_torrent_span = |info_hash: &Id20| -> tracing::Span {
-                        debug_span!(parent: session.rs(), "add_torrent", info_hash=?info_hash)
-                    };
-                    tokio::select! {
-                        Some(res) = futs.next(), if !futs.is_empty() => {
-                            if let Err(e) = res {
-                                error!("error adding torrent to session: {e:#}");
+                            while !added_all || !futs.is_empty() {
+                                // NOTE: this closure exists purely to workaround rustfmt screwing up when inlining it.
+                                let add_torrent_span = |info_hash: &Id20| -> tracing::Span {
+                                    debug_span!(parent: session.rs(), "add_torrent", info_hash=?info_hash)
+                                };
+                                tokio::select! {
+                                    Some(res) = futs.next(), if !futs.is_empty() => {
+                                        if let Err(e) = res {
+                                            error!("error adding torrent to session: {e:#}");
+                                        }
+                                    }
+                                    st = ps.next(), if !added_all => {
+                                        match st {
+                                            Some(st) => {
+                                                let (id, st) = st?;
+                                                let span = add_torrent_span(st.info_hash());
+                                                let (add_torrent, mut opts) = st.into_add_torrent()?;
+                                                opts.preferred_id = Some(id);
+                                                let fut = session.add_torrent(add_torrent, Some(opts));
+                                                let fut = fut.instrument(span);
+                                                futs.push(fut);
+                                            },
+                                            None => added_all = true
+                                        };
+                                    }
+                                };
                             }
+                            Ok(())
                         }
-                        st = ps.next(), if !added_all => {
-                            match st {
-                                Some(st) => {
-                                    let (id, st) = st?;
-                                    let span = add_torrent_span(st.info_hash());
-                                    let (add_torrent, mut opts) = st.into_add_torrent()?;
-                                    opts.preferred_id = Some(id);
-                                    let fut = session.add_torrent(add_torrent, Some(opts));
-                                    let fut = fut.instrument(span);
-                                    futs.push(fut);
-                                },
-                                None => added_all = true
-                            };
-                        }
-                    };
-                }
+                    },
+                );
             }
 
             session.start_speed_estimator_updater();
