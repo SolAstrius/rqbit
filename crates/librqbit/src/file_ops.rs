@@ -70,107 +70,154 @@ impl<'a> FileOps<'a> {
     }
 
     // Returns the bitvector with pieces we have.
+    //
+    // Uses a small read-ahead pipeline: a dedicated reader thread streams each
+    // piece's bytes off disk in large sequential reads (whole file-spans at
+    // once) while this thread hashes the previous piece. This keeps the disk
+    // continuously busy instead of idling during hashing, and avoids many tiny
+    // reads - both matter a lot on spinning disks. Intentionally a SINGLE
+    // sequential stream per torrent: parallel reads within one torrent would
+    // seek-thrash an HDD. Cross-torrent parallelism is handled by the caller's
+    // concurrency limit.
+    // Casts below are bounded by piece length (a u32), so they can't truncate.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn initial_check(&self, progress: &AtomicU64) -> anyhow::Result<BF> {
+        let lengths = *self.torrent.lengths();
         let mut have_pieces =
-            BF::from_boxed_slice(vec![0u8; self.torrent.lengths().piece_bitfield_bytes()].into());
-        let mut piece_files = Vec::<usize>::new();
+            BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into());
 
-        #[derive(Debug)]
-        struct CurrentFile<'a> {
-            index: usize,
-            fi: &'a FileInfo,
-            processed_bytes: u64,
-            is_broken: bool,
+        // How many pieces to read ahead. Memory use is roughly
+        // (PIPELINE_DEPTH + 1) * default_piece_length per torrent.
+        const PIPELINE_DEPTH: usize = 4;
+        let piece_buf_len = lengths.default_piece_length() as usize;
+
+        struct PieceData {
+            piece_index: ValidPieceIndex,
+            buf: Vec<u8>,
+            len: usize,
+            broken: bool,
         }
-        impl CurrentFile<'_> {
-            fn remaining(&self) -> u64 {
-                self.fi.len - self.processed_bytes
-            }
-            fn mark_processed_bytes(&mut self, bytes: u64) {
-                self.processed_bytes += bytes
-            }
+
+        // full: reader -> hasher (filled buffers). empty: hasher -> reader (recycled buffers).
+        let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<PieceData>(PIPELINE_DEPTH);
+        let (empty_tx, empty_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PIPELINE_DEPTH + 1);
+        for _ in 0..PIPELINE_DEPTH + 1 {
+            let _ = empty_tx.send(vec![0u8; piece_buf_len]);
         }
-        let mut file_iterator = self
-            .file_infos
-            .iter()
-            .enumerate()
-            .map(|(idx, fi)| CurrentFile {
-                index: idx,
-                fi,
-                processed_bytes: 0,
-                is_broken: false,
+
+        let files = self.files;
+        let file_infos = self.file_infos;
+
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            // Reader thread: walk pieces in order, read each piece into a recycled
+            // buffer, hand it to the hasher.
+            scope.spawn(move || {
+                struct CurrentFile<'a> {
+                    index: usize,
+                    fi: &'a FileInfo,
+                    processed_bytes: u64,
+                    is_broken: bool,
+                }
+                impl CurrentFile<'_> {
+                    fn remaining(&self) -> u64 {
+                        self.fi.len - self.processed_bytes
+                    }
+                }
+                let mut file_iterator =
+                    file_infos.iter().enumerate().map(|(index, fi)| CurrentFile {
+                        index,
+                        fi,
+                        processed_bytes: 0,
+                        is_broken: false,
+                    });
+                let mut current_file = match file_iterator.next() {
+                    Some(f) => f,
+                    None => return, // empty file list; hasher sees channel close
+                };
+
+                for piece_info in lengths.iter_piece_infos() {
+                    let mut buf = match empty_rx.recv() {
+                        Ok(b) => b,
+                        Err(_) => return, // hasher gone
+                    };
+                    let plen = piece_info.len as usize;
+                    if buf.len() < plen {
+                        buf.resize(plen, 0);
+                    }
+                    let mut filled = 0usize;
+                    let mut piece_remaining = plen;
+                    let mut broken = false;
+
+                    while piece_remaining > 0 {
+                        let mut to_read = current_file.remaining().min(piece_remaining as u64) as usize;
+                        while to_read == 0 {
+                            current_file = match file_iterator.next() {
+                                Some(f) => f,
+                                None => {
+                                    broken = true; // broken torrent metadata
+                                    break;
+                                }
+                            };
+                            to_read = current_file.remaining().min(piece_remaining as u64) as usize;
+                        }
+                        if broken {
+                            break;
+                        }
+
+                        let pos = current_file.processed_bytes;
+                        let dst = &mut buf[filled..filled + to_read];
+                        if current_file.fi.attrs.padding {
+                            dst.fill(0);
+                        } else if current_file.is_broken {
+                            broken = true;
+                        } else if let Err(err) = files.pread_exact(current_file.index, pos, dst) {
+                            debug!(
+                                "error reading from file {} ({:?}) at {}: {:#}",
+                                current_file.index, current_file.fi.relative_filename, pos, &err
+                            );
+                            current_file.is_broken = true;
+                            broken = true;
+                        }
+                        filled += to_read;
+                        piece_remaining -= to_read;
+                        current_file.processed_bytes += to_read as u64;
+                    }
+
+                    if full_tx
+                        .send(PieceData {
+                            piece_index: piece_info.piece_index,
+                            buf,
+                            len: plen,
+                            broken,
+                        })
+                        .is_err()
+                    {
+                        return; // hasher gone
+                    }
+                }
             });
 
-        let mut current_file = file_iterator.next().context("empty input file list")?;
-
-        let mut read_buffer = vec![0u8; 65536];
-
-        for piece_info in self.torrent.lengths().iter_piece_infos() {
-            piece_files.clear();
-            let mut computed_hash = Sha1::new();
-            let mut piece_remaining = piece_info.len as usize;
-            let mut some_files_broken = false;
-            progress.fetch_add(piece_info.len as u64, Ordering::Relaxed);
-
-            while piece_remaining > 0 {
-                let mut to_read_in_file: usize =
-                    std::cmp::min(current_file.remaining(), piece_remaining as u64).try_into()?;
-
-                // Keep changing the current file to next until we find a file that has greater than 0 length.
-                while to_read_in_file == 0 {
-                    current_file = file_iterator.next().context("broken torrent metadata")?;
-
-                    to_read_in_file =
-                        std::cmp::min(current_file.remaining(), piece_remaining as u64)
-                            .try_into()?;
+            // Hasher (this thread): hash each piece and compare.
+            while let Ok(pd) = full_rx.recv() {
+                progress.fetch_add(pd.len as u64, Ordering::Relaxed);
+                if pd.broken {
+                    trace!("piece {} had read errors, marking as needed", pd.piece_index);
+                } else {
+                    let mut computed_hash = Sha1::new();
+                    computed_hash.update(&pd.buf[..pd.len]);
+                    if self
+                        .torrent
+                        .info()
+                        .compare_hash(pd.piece_index.get(), computed_hash.finish())
+                        .context("bug: torrent info broken or piece index invalid")?
+                    {
+                        have_pieces.set(pd.piece_index.get() as usize, true);
+                    }
                 }
-
-                piece_files.push(current_file.index);
-
-                let pos = current_file.processed_bytes;
-                piece_remaining -= to_read_in_file;
-                current_file.mark_processed_bytes(to_read_in_file as u64);
-
-                if current_file.is_broken {
-                    // no need to read.
-                    continue;
-                }
-
-                if let Err(err) = update_hash_from_file(
-                    current_file.index,
-                    current_file.fi,
-                    pos,
-                    self.files,
-                    &mut computed_hash,
-                    &mut read_buffer,
-                    to_read_in_file,
-                ) {
-                    debug!(
-                        "error reading from file {} ({:?}) at {}: {:#}",
-                        current_file.index, current_file.fi.relative_filename, pos, &err
-                    );
-                    current_file.is_broken = true;
-                    some_files_broken = true;
-                }
+                let _ = empty_tx.send(pd.buf);
             }
-
-            if some_files_broken {
-                trace!(
-                    "piece {} had errors, marking as needed",
-                    piece_info.piece_index
-                );
-                continue;
-            }
-
-            if self
-                .torrent
-                .info()
-                .compare_hash(piece_info.piece_index.get(), computed_hash.finish())
-                .context("bug: either torrent info broken or we have a bug - piece index invalid")?
-            {
-                have_pieces.set(piece_info.piece_index.get() as usize, true);
-            }
-        }
+            Ok(())
+        })?;
 
         Ok(have_pieces)
     }
