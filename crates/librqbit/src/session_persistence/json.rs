@@ -202,6 +202,19 @@ impl BitVFactory for JsonSessionPersistenceStore {
         }
     }
 
+    async fn last_modified(
+        &self,
+        id: TorrentIdOrHash,
+    ) -> anyhow::Result<Option<std::time::SystemTime>> {
+        let h = self.to_hash(id).await?;
+        let filename = self.bitv_filename(&h);
+        match tokio::fs::metadata(&filename).await {
+            Ok(m) => Ok(m.modified().ok()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("error statting {filename:?}")),
+        }
+    }
+
     async fn clear(&self, id: TorrentIdOrHash) -> anyhow::Result<()> {
         let h = self.to_hash(id).await?;
         let filename = self.bitv_filename(&h);

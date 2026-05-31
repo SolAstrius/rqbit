@@ -311,6 +311,12 @@ struct ServerStartOptions {
     #[arg(long = "fastresume", env = "RQBIT_FASTRESUME")]
     fastresume: bool,
 
+    /// [Experimental] With --fastresume, trust on-disk data whose size+mtime are unchanged
+    /// since last run and skip the full fastresume checksum (a few random pieces are still
+    /// verified). Safe on integrity-checking filesystems (ZFS, btrfs); leave off otherwise.
+    #[arg(long = "trust-fastresume", env = "RQBIT_TRUST_FASTRESUME")]
+    trust_fastresume: bool,
+
     /// The folder to watch for added .torrent files. All files in this folder will be automatically added
     /// to the session.
     #[arg(long = "watch-folder", env = "RQBIT_WATCH_FOLDER")]
@@ -647,6 +653,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         concurrent_init_limit: Some(opts.concurrent_init_limit),
         root_span: None,
         fastresume: false,
+        trust_fastresume: false,
         cancellation_token: Some(cancel.clone()),
         #[cfg(feature = "disable-upload")]
         disable_upload: opts.disable_upload,
@@ -728,6 +735,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
 
                 http_api_opts.read_only = false;
                 sopts.fastresume = start_opts.fastresume;
+                sopts.trust_fastresume = start_opts.trust_fastresume;
 
                 let session =
                     Session::new_with_opts(PathBuf::from(&start_opts.output_folder), sopts)

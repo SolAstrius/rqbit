@@ -11,7 +11,7 @@ use anyhow::Context;
 use itertools::Itertools;
 use rand::Rng;
 use size_format::SizeFormatterBinary as SF;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     api::TorrentIdOrHash,
@@ -23,6 +23,10 @@ use crate::{
 };
 
 use super::{ManagedTorrentShared, TorrentMetadata, paused::TorrentStatePaused};
+
+/// Number of pieces verified on the trusted fastresume path (data unchanged
+/// since last checkpoint). A cheap safety net, O(1) regardless of file count.
+const TRUSTED_FASTRESUME_SAMPLE_PIECES: usize = 4;
 
 pub struct TorrentStateInitializing {
     pub(crate) files: FileStorage,
@@ -60,6 +64,7 @@ impl TorrentStateInitializing {
         &self,
         bitv_factory: &dyn BitVFactory,
         have_pieces: Option<Box<dyn BitV>>,
+        trust: bool,
     ) -> Option<Box<dyn BitV>> {
         let hp = have_pieces?;
         let actual = hp.as_bytes().len();
@@ -73,6 +78,24 @@ impl TorrentStateInitializing {
             return None;
         }
 
+        // Opt-in trust path: the persisted bitfield's own mtime is the reference
+        // "as-of" timestamp. If every file is unchanged since then (checked in the
+        // blocking section below), we only verify a small random sample of pieces.
+        let trusted_reference = if trust {
+            match bitv_factory
+                .last_modified(self.shared.info_hash.into())
+                .await
+            {
+                Ok(mtime) => mtime,
+                Err(e) => {
+                    debug!(error = ?e, "could not read bitfield mtime; not trusting fastresume");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let is_broken = self
             .shared
             .spawner
@@ -83,37 +106,74 @@ impl TorrentStateInitializing {
                     &self.metadata.file_infos,
                 );
 
-                use rand::seq::SliceRandom;
+                use rand::seq::{IndexedRandom, SliceRandom};
 
                 let mut to_validate = BF::from_boxed_slice(
                     vec![0u8; self.metadata.lengths().piece_bitfield_bytes()].into_boxed_slice(),
                 );
-                let mut queue = hp.as_slice().to_owned();
 
-                // Validate at least one piece from each file, if we claim we have it.
-                for fi in self.metadata.file_infos.iter() {
-                    let prange = fi.piece_range_usize();
-                    let offset = prange.start;
-                    for piece_id in hp
-                        .as_slice()
-                        .get(fi.piece_range_usize())
-                        .into_iter()
-                        .flat_map(|s| s.iter_ones())
-                        .map(|pid| pid + offset)
-                        .take(1)
+                // Is every (non-padding) file unchanged since the bitfield was
+                // persisted? One cheap stat per file vs. the bitv mtime.
+                let trusted = trusted_reference.is_some_and(|bitv_mtime| {
+                    self.metadata
+                        .file_infos
+                        .iter()
+                        .enumerate()
+                        .all(|(fid, fi)| {
+                            if fi.attrs.padding {
+                                return true;
+                            }
+                            match self.files.stat(fid) {
+                                Ok(st) => {
+                                    st.len == fi.len && st.modified.is_some_and(|m| m <= bitv_mtime)
+                                }
+                                // backend can't stat (unsupported/error) -> don't trust
+                                Err(_) => false,
+                            }
+                        })
+                });
+
+                if trusted {
+                    // Cheap pass: a small random sample of the pieces we have.
+                    let have = hp.as_slice().iter_ones().collect_vec();
+                    for &piece_id in
+                        have.choose_multiple(&mut rand::rng(), TRUSTED_FASTRESUME_SAMPLE_PIECES)
                     {
                         to_validate.set(piece_id, true);
-                        queue.set(piece_id, false);
                     }
-                }
+                    debug!(
+                        id = ?self.shared.id,
+                        sampled = to_validate.count_ones(),
+                        "fastresume: data unchanged since checkpoint, doing cheap validation"
+                    );
+                } else {
+                    let mut queue = hp.as_slice().to_owned();
 
-                // For all the remaining pieces we claim we have, validate them with decreasing probability.
-                let mut queue = queue.iter_ones().collect_vec();
-                queue.shuffle(&mut rand::rng());
-                for (tmp_id, piece_id) in queue.into_iter().enumerate() {
-                    let denom: u32 = (tmp_id + 1).min(50).try_into().unwrap();
-                    if rand::rng().random_ratio(1, denom) {
-                        to_validate.set(piece_id, true);
+                    // Validate at least one piece from each file, if we claim we have it.
+                    for fi in self.metadata.file_infos.iter() {
+                        let prange = fi.piece_range_usize();
+                        let offset = prange.start;
+                        for piece_id in hp
+                            .as_slice()
+                            .get(fi.piece_range_usize())
+                            .into_iter()
+                            .flat_map(|s| s.iter_ones())
+                            .map(|pid| pid + offset)
+                            .take(1)
+                        {
+                            to_validate.set(piece_id, true);
+                            queue.set(piece_id, false);
+                        }
+                    }
+
+                    // For all the remaining pieces we claim we have, validate them with decreasing probability.
+                    let mut queue = queue.iter_ones().collect_vec();
+                    queue.shuffle(&mut rand::rng());
+                    for (tmp_id, piece_id) in queue.into_iter().enumerate() {
+                        let denom: u32 = (tmp_id + 1).min(50).try_into().unwrap();
+                        if rand::rng().random_ratio(1, denom) {
+                            to_validate.set(piece_id, true);
+                        }
                     }
                 }
 
@@ -164,13 +224,9 @@ impl TorrentStateInitializing {
 
     pub async fn check(&self) -> anyhow::Result<TorrentStatePaused> {
         let id: TorrentIdOrHash = self.shared.info_hash.into();
-        let bitv_factory = self
-            .shared
-            .session
-            .upgrade()
-            .context("session is dead")?
-            .bitv_factory
-            .clone();
+        let session = self.shared.session.upgrade().context("session is dead")?;
+        let bitv_factory = session.bitv_factory.clone();
+        let trust = session.trust_fastresume;
         let have_pieces = if self.previously_errored {
             if let Err(e) = bitv_factory.clear(id).await {
                 warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, error=?e, "error clearing bitfield");
@@ -183,7 +239,9 @@ impl TorrentStateInitializing {
                 .context("error loading have_pieces")?
         };
 
-        let have_pieces = self.validate_fastresume(&*bitv_factory, have_pieces).await;
+        let have_pieces = self
+            .validate_fastresume(&*bitv_factory, have_pieces, trust)
+            .await;
 
         let have_pieces = match have_pieces {
             Some(h) => h,
@@ -200,8 +258,7 @@ impl TorrentStateInitializing {
                     .await?;
                 let elapsed = check_start.elapsed();
                 let total = self.metadata.lengths().total_length();
-                let mibps =
-                    (total as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64().max(0.001);
+                let mibps = (total as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64().max(0.001);
                 info!(
                     ?elapsed,
                     "initial check read {} at {mibps:.0} MiB/s",

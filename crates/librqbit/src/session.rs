@@ -109,6 +109,7 @@ pub struct Session {
     pub(crate) db: RwLock<SessionDatabase>,
     next_id: AtomicUsize,
     pub(crate) bitv_factory: Arc<dyn BitVFactory>,
+    pub(crate) trust_fastresume: bool,
     spawner: BlockingSpawner,
 
     // Network
@@ -415,6 +416,13 @@ pub struct SessionOptions {
 
     /// Enable fastresume, to restore state quickly after restart.
     pub fastresume: bool,
+
+    /// When fastresume is enabled, trust on-disk data whose size+mtime are
+    /// unchanged since the bitfield was last persisted, skipping the full
+    /// checksum spot-check (a few random pieces are still verified). Intended
+    /// for integrity-checking filesystems (ZFS, btrfs). No effect without
+    /// fastresume.
+    pub trust_fastresume: bool,
 
     /// Turn on to dump session contents into a file periodically, so that on next start
     /// all remembered torrents will continue where they left off.
@@ -777,6 +785,7 @@ impl Session {
             let session = Arc::new(Self {
                 persistence,
                 bitv_factory,
+                trust_fastresume: opts.trust_fastresume,
                 peer_id,
                 dht,
                 peer_opts,

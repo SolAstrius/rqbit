@@ -9,6 +9,16 @@ pub trait BitVFactory: Send + Sync {
         id: TorrentIdOrHash,
         b: BF,
     ) -> anyhow::Result<Box<dyn BitV>>;
+
+    /// Last-modified time of the persisted bitfield, used as the reference
+    /// "as-of" timestamp for the opt-in fastresume trust path. Default: None
+    /// (trust won't engage on backends that can't report it).
+    async fn last_modified(
+        &self,
+        _id: TorrentIdOrHash,
+    ) -> anyhow::Result<Option<std::time::SystemTime>> {
+        Ok(None)
+    }
 }
 
 pub struct NonPersistentBitVFactory {}

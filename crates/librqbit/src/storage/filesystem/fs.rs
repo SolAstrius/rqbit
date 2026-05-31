@@ -12,7 +12,7 @@ use crate::{
     torrent_state::{ManagedTorrentShared, TorrentMetadata},
 };
 
-use crate::storage::{StorageFactory, TorrentStorage};
+use crate::storage::{FileStat, StorageFactory, TorrentStorage};
 
 use super::opened_file::OpenedFile;
 
@@ -164,5 +164,17 @@ impl TorrentStorage for FilesystemStorage {
 
         self.opened_files = files;
         Ok(())
+    }
+
+    fn stat(&self, file_id: usize) -> anyhow::Result<FileStat> {
+        let of = self.opened_files.get(file_id).context("no such file")?;
+        let m = of
+            .lock_read()?
+            .metadata()
+            .context("error reading file metadata")?;
+        Ok(FileStat {
+            len: m.len(),
+            modified: m.modified().ok(),
+        })
     }
 }

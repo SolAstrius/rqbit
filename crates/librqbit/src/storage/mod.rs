@@ -117,6 +117,13 @@ impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
     }
 }
 
+/// File metadata reported by a storage backend, for the fastresume trust path.
+#[derive(Debug, Clone, Copy)]
+pub struct FileStat {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
 pub trait TorrentStorage: Send + Sync {
     // Create/open files etc.
     fn init(
@@ -168,6 +175,14 @@ pub trait TorrentStorage: Send + Sync {
     fn on_piece_completed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Current on-disk length and last-modified time of a file, if the backend
+    /// can report them. Used by the opt-in fastresume trust path. Default is
+    /// "unsupported", so trust simply doesn't engage on backends that can't
+    /// answer (rather than being unsafe).
+    fn stat(&self, _file_id: usize) -> anyhow::Result<FileStat> {
+        anyhow::bail!("stat is not supported by this storage backend")
+    }
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -205,5 +220,9 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_completed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_completed(piece_id)
+    }
+
+    fn stat(&self, file_id: usize) -> anyhow::Result<FileStat> {
+        (**self).stat(file_id)
     }
 }
