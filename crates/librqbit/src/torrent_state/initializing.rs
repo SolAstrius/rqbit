@@ -127,7 +127,10 @@ impl TorrentStateInitializing {
                     })
                     .enumerate()
                 {
-                    if fo.check_piece(piece_id).is_err() {
+                    // check_piece returns Ok(true)=match, Ok(false)=hash MISMATCH
+                    // (on-disk corruption), Err=I/O error. Anything but Ok(true)
+                    // means the fastresume bitfield can't be trusted.
+                    if !matches!(fo.check_piece(piece_id), Ok(true)) {
                         return true;
                     }
 
