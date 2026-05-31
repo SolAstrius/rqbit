@@ -1044,21 +1044,38 @@ async fn start_http_api(
 async fn stats_printer(session: Arc<Session>) -> Result<(), &'static str> {
     loop {
         session.with_torrents(|torrents| {
+                // Per-torrent detail is logged at DEBUG (it's far too verbose for
+                // INFO with many torrents - hundreds of lines/sec drowns the log).
+                // At INFO we emit a single aggregate summary line per cycle.
+                let mut n_total = 0u64;
+                let mut n_init = 0u64;
+                let mut n_live = 0u64;
+                let mut down_mbps = 0f64;
+                let mut up_mbps = 0f64;
+                let mut total_bytes = 0u64;
+                let mut progress_bytes = 0u64;
                 for (idx, torrent) in torrents {
+                    n_total += 1;
                     let stats = torrent.stats();
+                    total_bytes += stats.total_bytes;
+                    progress_bytes += stats.progress_bytes;
                     if let TorrentStatsState::Initializing = stats.state {
+                        n_init += 1;
                         let total = stats.total_bytes;
                         let progress = stats.progress_bytes;
                         let pct =  (progress as f64 / total as f64) * 100f64;
-                        info!("[{}] initializing {:.2}%", idx, pct);
+                        tracing::debug!("[{}] initializing {:.2}%", idx, pct);
                         continue;
                     }
                     let (live, live_stats) = match (torrent.live(), stats.live.as_ref()) {
                         (Some(live), Some(live_stats)) => (live, live_stats),
                         _ => continue
                     };
+                    n_live += 1;
                     let down_speed = live.down_speed_estimator();
                     let up_speed = live.up_speed_estimator();
+                    down_mbps += down_speed.mbps();
+                    up_mbps += up_speed.mbps();
                     let total = stats.total_bytes;
                     let progress = stats.progress_bytes;
                     let downloaded_pct = if stats.finished {
@@ -1072,7 +1089,7 @@ async fn stats_printer(session: Arc<Session>) -> Result<(), &'static str> {
                         None => String::new()
                     };
                     let peer_stats = &live_stats.snapshot.peer_stats;
-                    info!(
+                    tracing::debug!(
                         "[{}]: {:.2}% ({:.2} / {:.2}), ↓{:.2} MiB/s, ↑{:.2} MiB/s ({:.2}){}, {{live: {}, queued: {}, dead: {}, known: {}}}",
                         idx,
                         downloaded_pct,
@@ -1088,6 +1105,21 @@ async fn stats_printer(session: Arc<Session>) -> Result<(), &'static str> {
                         peer_stats.seen,
                     );
                 }
+                let overall_pct = if total_bytes > 0 {
+                    (progress_bytes as f64 / total_bytes as f64) * 100f64
+                } else {
+                    100f64
+                };
+                info!(
+                    "{} torrents: {} live, {} initializing, {} idle; {:.1}% complete; ↓{:.2} MiB/s ↑{:.2} MiB/s",
+                    n_total,
+                    n_live,
+                    n_init,
+                    n_total.saturating_sub(n_live).saturating_sub(n_init),
+                    overall_pct,
+                    down_mbps,
+                    up_mbps,
+                );
             });
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
