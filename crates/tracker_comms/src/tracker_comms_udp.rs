@@ -304,7 +304,10 @@ impl UdpTrackerClient {
     }
 
     async fn run(self) -> anyhow::Result<()> {
-        let mut buf = [0u8; 16384];
+        // Max UDP payload (65507) rounded up: a smaller buffer truncates large
+        // tracker responses on the plain socket, and makes the SOCKS5
+        // (fast-socks5) path panic when a relayed datagram exceeds it.
+        let mut buf = vec![0u8; 65536];
         loop {
             let (len, addr) = match self.state.sock.recv_from(&mut buf).await {
                 Ok(r) => r,

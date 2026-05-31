@@ -1182,7 +1182,10 @@ impl DhtWorker {
             Err(Error::DhtDead)
         };
         let reader = async {
-            let mut buf = vec![0u8; 16384];
+            // Max UDP payload (65507) rounded up. Must fit the largest datagram:
+            // a smaller buffer truncates responses on the plain socket, and makes
+            // the SOCKS5 (fast-socks5) path panic when a relayed datagram exceeds it.
+            let mut buf = vec![0u8; 65536];
             loop {
                 let (size, addr) = socket.recv_from(&mut buf).await.map_err(Error::Recv)?;
                 match bprotocol::deserialize_message::<ByteBufOwned>(&buf[..size]) {
