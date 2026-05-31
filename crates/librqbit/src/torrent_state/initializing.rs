@@ -186,6 +186,7 @@ impl TorrentStateInitializing {
             Some(h) => h,
             None => {
                 info!("Doing initial checksum validation, this might take a while...");
+                let check_start = Instant::now();
                 let have_pieces = self
                     .shared
                     .spawner
@@ -194,6 +195,15 @@ impl TorrentStateInitializing {
                             .initial_check(&self.checked_bytes)
                     })
                     .await?;
+                let elapsed = check_start.elapsed();
+                let total = self.metadata.lengths().total_length();
+                let mibps =
+                    (total as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64().max(0.001);
+                info!(
+                    ?elapsed,
+                    "initial check read {} at {mibps:.0} MiB/s",
+                    SF::new(total)
+                );
                 bitv_factory
                     .store_initial_check(id, have_pieces)
                     .await
