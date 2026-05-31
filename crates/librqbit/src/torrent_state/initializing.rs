@@ -28,6 +28,11 @@ use super::{ManagedTorrentShared, TorrentMetadata, paused::TorrentStatePaused};
 /// since last checkpoint). A cheap safety net, O(1) regardless of file count.
 const TRUSTED_FASTRESUME_SAMPLE_PIECES: usize = 4;
 
+/// On the full (untrusted) fastresume check, validate at most one piece from
+/// this many files. Torrents with thousands of files would otherwise issue
+/// thousands of scattered reads; beyond this we sample a random spread of files.
+const FULL_CHECK_MAX_SAMPLED_FILES: usize = 16;
+
 pub struct TorrentStateInitializing {
     pub(crate) files: FileStorage,
     pub(crate) shared: Arc<ManagedTorrentShared>,
@@ -149,21 +154,31 @@ impl TorrentStateInitializing {
                 } else {
                     let mut queue = hp.as_slice().to_owned();
 
-                    // Validate at least one piece from each file, if we claim we have it.
-                    for fi in self.metadata.file_infos.iter() {
-                        let prange = fi.piece_range_usize();
-                        let offset = prange.start;
-                        for piece_id in hp
-                            .as_slice()
-                            .get(fi.piece_range_usize())
-                            .into_iter()
-                            .flat_map(|s| s.iter_ones())
-                            .map(|pid| pid + offset)
-                            .take(1)
-                        {
-                            to_validate.set(piece_id, true);
-                            queue.set(piece_id, false);
-                        }
+                    // Validate at least one piece from each file we claim to have,
+                    // capped to a budget (FULL_CHECK_MAX_SAMPLED_FILES). When a
+                    // torrent has more files than the budget, sample a random
+                    // spread of files instead of one-per-file.
+                    let mut per_file: Vec<usize> = self
+                        .metadata
+                        .file_infos
+                        .iter()
+                        .filter_map(|fi| {
+                            let offset = fi.piece_range_usize().start;
+                            hp.as_slice()
+                                .get(fi.piece_range_usize())
+                                .into_iter()
+                                .flat_map(|s| s.iter_ones())
+                                .map(|pid| pid + offset)
+                                .next()
+                        })
+                        .collect();
+                    if per_file.len() > FULL_CHECK_MAX_SAMPLED_FILES {
+                        per_file.shuffle(&mut rand::rng());
+                        per_file.truncate(FULL_CHECK_MAX_SAMPLED_FILES);
+                    }
+                    for piece_id in per_file {
+                        to_validate.set(piece_id, true);
+                        queue.set(piece_id, false);
                     }
 
                     // For all the remaining pieces we claim we have, validate them with decreasing probability.
