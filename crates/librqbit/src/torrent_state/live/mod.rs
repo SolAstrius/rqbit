@@ -606,6 +606,16 @@ impl TorrentStateLive {
         mut peer_queue_rx: UnboundedReceiver<SocketAddr>,
     ) -> crate::Result<()> {
         let state = self;
+        // Startup gate: during the initial persistence reload, hold off on connecting
+        // out to peers until the reload's initial checks have drained, so startup disk
+        // I/O isn't contended by seeding/downloading. Open (no-op) outside startup.
+        if let Some(session) = state.shared.session.upgrade() {
+            let mut rx = session.peers_unblocked_tx.subscribe();
+            if !*rx.borrow_and_update() {
+                debug!("startup: holding peer connections until reload drains");
+                let _ = rx.wait_for(|unblocked| *unblocked).await;
+            }
+        }
         loop {
             let addr = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
             if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {

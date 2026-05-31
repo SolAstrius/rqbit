@@ -334,6 +334,15 @@ impl ManagedTorrent {
         peer_rx: Option<PeerStream>,
         start_paused: bool,
     ) -> anyhow::Result<()> {
+        // Decrements the session's in-flight-init counter on completion (every exit
+        // path), so the startup peer gate knows when the reload has drained.
+        struct PendingInitGuard(Arc<Session>);
+        impl Drop for PendingInitGuard {
+            fn drop(&mut self) {
+                self.0.pending_inits.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
         fn _start<'a>(
             t: &'a Arc<ManagedTorrent>,
             peer_rx: Option<PeerStream>,
@@ -359,6 +368,8 @@ impl ManagedTorrent {
                         "initialize_and_start",
                         token.clone(),
                         async move {
+                            session.pending_inits.fetch_add(1, Ordering::Relaxed);
+                            let _pending_init_guard = PendingInitGuard(session.clone());
                             let concurrent_init_semaphore =
                                 session.concurrent_initialize_semaphore.clone();
                             let _permit = concurrent_init_semaphore

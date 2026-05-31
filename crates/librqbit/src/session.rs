@@ -104,12 +104,28 @@ impl SessionDatabase {
     }
 }
 
+/// Re-opens the startup peer gate when dropped, so the gate can never stay closed
+/// (which would wedge all peer connectivity) if the reload task exits early via an
+/// error or panic. Belt-and-suspenders alongside the explicit open on the happy path.
+struct OpenLatchOnDrop(Arc<Session>);
+impl Drop for OpenLatchOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.peers_unblocked_tx.send_replace(true);
+    }
+}
+
 pub struct Session {
     // Core state and services
     pub(crate) db: RwLock<SessionDatabase>,
     next_id: AtomicUsize,
     pub(crate) bitv_factory: Arc<dyn BitVFactory>,
     pub(crate) trust_fastresume: bool,
+    // Startup peer-activity gate. `false` while the initial persistence reload's
+    // checks are draining, then `true`. Live torrents wait on it before connecting
+    // out to peers, so startup disk I/O isn't contended. Default `true` (no gating).
+    pub(crate) peers_unblocked_tx: tokio::sync::watch::Sender<bool>,
+    // In-flight initial checks; lets the reload know when it has drained.
+    pub(crate) pending_inits: AtomicUsize,
     spawner: BlockingSpawner,
 
     // Network
@@ -786,6 +802,8 @@ impl Session {
                 persistence,
                 bitv_factory,
                 trust_fastresume: opts.trust_fastresume,
+                peers_unblocked_tx: tokio::sync::watch::channel(true).0,
+                pending_inits: AtomicUsize::new(0),
                 peer_id,
                 dht,
                 peer_opts,
@@ -872,12 +890,19 @@ impl Session {
             // unreachable (502) for the whole window. Torrents now populate as they
             // load.
             if session.persistence.is_some() {
+                // Close the peer gate until the reload's checks drain (re-opened at
+                // the end of the spawned task below), so startup disk I/O isn't
+                // contended by seeding/downloading.
+                let _ = session.peers_unblocked_tx.send_replace(false);
                 session.spawn(
                     debug_span!(parent: session.rs(), "load_persisted_torrents"),
                     "load_persisted_torrents",
                     {
                         let session = session.clone();
                         async move {
+                            // Guarantee the gate re-opens however this task exits
+                            // (success, early `?` error, or panic) - never wedge peers.
+                            let _open_latch_guard = OpenLatchOnDrop(session.clone());
                             let persistence = session
                                 .persistence
                                 .as_ref()
@@ -915,6 +940,23 @@ impl Session {
                                     }
                                 };
                             }
+
+                            // All torrents added; wait for their initial checks to
+                            // drain so the disk is free for fast checks, then allow
+                            // peer connections. Hard timeout so a bug in the drain
+                            // logic can never permanently wedge connectivity.
+                            let started = tokio::time::Instant::now();
+                            while session.pending_inits.load(Ordering::Acquire) > 0 {
+                                if started.elapsed() >= Duration::from_secs(300) {
+                                    warn!(
+                                        "startup peer-block timeout reached; unblocking peers with checks still pending"
+                                    );
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
+                            let _ = session.peers_unblocked_tx.send_replace(true);
+                            info!("startup reload drained; peer connections unblocked");
                             Ok(())
                         }
                     },
