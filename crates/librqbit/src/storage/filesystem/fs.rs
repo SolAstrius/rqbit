@@ -94,7 +94,16 @@ impl TorrentStorage for FilesystemStorage {
         let f = &self.opened_files.get(file_id).context("no such file")?;
         #[cfg(windows)]
         f.try_mark_sparse()?;
-        Ok(f.lock_read()?.set_len(len)?)
+        let file = f.lock_read()?;
+        // Skip set_len when the file is already the right size. It's a no-op for
+        // data in that case, but on some filesystems (notably ZFS) it still bumps
+        // mtime - which is needless startup I/O for every file, and defeats the
+        // fastresume trust check by making data files look newer than the
+        // persisted bitfield on every restart.
+        if file.metadata()?.len() == len {
+            return Ok(());
+        }
+        Ok(file.set_len(len)?)
     }
 
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
