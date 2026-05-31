@@ -230,7 +230,9 @@ impl<'a> FileOps<'a> {
         let mut h = Sha1::new();
         let piece_length = self.torrent.lengths().piece_length(piece_index);
         let mut absolute_offset = self.torrent.lengths().piece_offset(piece_index);
-        let mut buf = vec![0u8; std::cmp::min(65536, piece_length as usize)];
+        // Read in large chunks (whole file-spans for typical pieces) rather than
+        // 64 KiB, capped to bound memory. Same bytes hashed - validation unchanged.
+        let mut buf = vec![0u8; std::cmp::min(4 * 1024 * 1024, piece_length as usize)];
 
         let mut piece_remaining_bytes = piece_length as usize;
 
