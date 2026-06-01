@@ -148,6 +148,8 @@ impl JsonSessionPersistenceStore {
             only_files: torrent.only_files().clone(),
             is_paused: torrent.is_paused(),
             output_folder: torrent.shared().options.output_folder.clone(),
+            tags: torrent.tags(),
+            finished_at: torrent.finished_at(),
         };
 
         let torrent_bytes = torrent

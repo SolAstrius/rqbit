@@ -26,6 +26,8 @@ struct TorrentsTableRecord {
     output_folder: String,
     only_files: Option<Vec<i32>>,
     is_paused: bool,
+    tags: Option<Vec<String>>,
+    finished_at: Option<i64>,
 }
 
 impl TorrentsTableRecord {
@@ -41,6 +43,8 @@ impl TorrentsTableRecord {
                     .only_files
                     .map(|v| v.into_iter().map(|v| v as usize).collect()),
                 is_paused: self.is_paused,
+                tags: self.tags.unwrap_or_default().into_iter().collect(),
+                finished_at: self.finished_at.map(|v| v as u64),
             },
         ))
     }
@@ -80,6 +84,8 @@ impl PostgresSessionStorage {
         );
 
         exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS have_bitfield BYTEA");
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS tags TEXT[]");
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS finished_at BIGINT");
 
         Ok(Self { pool })
     }
@@ -102,8 +108,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
-        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused)
-        VALUES($1, $2, $3, $4, $5, $6, $7)
+        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, tags, finished_at)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT(id) DO NOTHING";
         sqlx::query(q)
             .bind::<i32>(id.try_into()?)
@@ -132,6 +138,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
                     .collect::<Vec<i32>>()
             }))
             .bind(torrent.is_paused())
+            .bind(torrent.tags().into_iter().collect::<Vec<String>>())
+            .bind(torrent.finished_at().map(|v| v as i64))
             .execute(&self.pool)
             .await
             .context("error executing INSERT INTO torrents")?;
@@ -163,13 +171,17 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         id: TorrentId,
         torrent: &ManagedTorrentHandle,
     ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE torrents SET only_files = $1, is_paused = $2 WHERE id = $3")
+        sqlx::query(
+            "UPDATE torrents SET only_files = $1, is_paused = $2, tags = $3, finished_at = $4 WHERE id = $5",
+        )
             .bind(torrent.only_files().map(|v| {
                 v.into_iter()
                     .filter_map(|f| f.try_into().ok())
                     .collect::<Vec<i32>>()
             }))
             .bind(torrent.is_paused())
+            .bind(torrent.tags().into_iter().collect::<Vec<String>>())
+            .bind(torrent.finished_at().map(|v| v as i64))
             .bind::<i32>(id.try_into()?)
             .execute(&self.pool)
             .await

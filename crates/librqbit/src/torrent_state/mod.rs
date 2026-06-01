@@ -105,6 +105,10 @@ pub(crate) struct ManagedTorrentLocked {
     pub(crate) paused: bool,
     pub(crate) state: ManagedTorrentState,
     pub(crate) only_files: Option<Vec<usize>>,
+    // Unix timestamp (seconds) at which the torrent finished downloading, if observed.
+    pub(crate) finished_at: Option<u64>,
+    // Arbitrary user-assigned labels (e.g. categories for download-client integrations).
+    pub(crate) tags: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -246,6 +250,36 @@ impl ManagedTorrent {
 
     pub fn only_files(&self) -> Option<Vec<usize>> {
         self.locked.read().only_files.clone()
+    }
+
+    /// User-assigned tags/labels for this torrent.
+    pub fn tags(&self) -> HashSet<String> {
+        self.locked.read().tags.clone()
+    }
+
+    /// Replace this torrent's tags/labels. Returns true if they changed.
+    pub fn set_tags(&self, tags: HashSet<String>) -> bool {
+        let mut g = self.locked.write();
+        if g.tags == tags {
+            return false;
+        }
+        g.tags = tags;
+        true
+    }
+
+    /// Unix timestamp (seconds) at which the torrent finished downloading, if observed.
+    pub fn finished_at(&self) -> Option<u64> {
+        self.locked.read().finished_at
+    }
+
+    /// Record the completion timestamp if not already set. Returns true if it was newly set.
+    pub(crate) fn set_finished_at_if_unset(&self, now_unix_secs: u64) -> bool {
+        let mut g = self.locked.write();
+        if g.finished_at.is_some() {
+            return false;
+        }
+        g.finished_at = Some(now_unix_secs);
+        true
     }
 
     pub fn with_state<R>(&self, f: impl FnOnce(&ManagedTorrentState) -> R) -> R {
@@ -413,10 +447,11 @@ impl ManagedTorrent {
                     g.state = ManagedTorrentState::Live(live.clone());
                     t.state_change_notify.notify_waiters();
 
-                    spawn_fatal_errors_receiver(t, rx, token);
+                    spawn_fatal_errors_receiver(t, rx, token.clone());
                     if let Some(peer_rx) = peer_rx {
                         spawn_peer_adder(&live, peer_rx);
                     }
+                    spawn_completion_watcher(t, &live, session, token);
                     Ok(())
                 }
                 ManagedTorrentState::Error(_) => {
@@ -503,10 +538,13 @@ impl ManagedTorrent {
             progress_bytes: 0,
             uploaded_bytes: 0,
             finished: false,
+            ratio: 0.0,
+            eta_seconds: None,
+            finished_at: None,
             live: None,
         };
 
-        self.with_state(|s| {
+        let mut resp = self.with_state(|s| {
             match s {
                 ManagedTorrentState::Initializing(i) => {
                     resp.state = S::Initializing;
@@ -546,7 +584,21 @@ impl ManagedTorrent {
                 }
             }
             resp
-        })
+        });
+
+        // Derived fields, exposed so API consumers are pure renaming layers.
+        resp.ratio = if resp.progress_bytes > 0 {
+            resp.uploaded_bytes as f64 / resp.progress_bytes as f64
+        } else {
+            0.0
+        };
+        resp.eta_seconds = resp
+            .live
+            .as_ref()
+            .and_then(|l| l.time_remaining.as_ref())
+            .map(|t| t.as_secs());
+        resp.finished_at = self.locked.read().finished_at;
+        resp
     }
 
     #[inline(never)]
@@ -660,6 +712,40 @@ fn spawn_fatal_errors_receiver(
                     ?info_hash,
                     "tried to stop the torrent with error, but couldn't upgrade the arc"
                 );
+            }
+            Ok(())
+        },
+    );
+}
+
+// Records the completion timestamp (and persists it) the first time the torrent
+// finishes downloading, so seed-time can be tracked across restarts.
+fn spawn_completion_watcher(
+    state: &Arc<ManagedTorrent>,
+    live: &Arc<TorrentStateLive>,
+    session: Arc<Session>,
+    token: CancellationToken,
+) {
+    let span = state.shared.span.clone();
+    let state = Arc::downgrade(state);
+    let live = live.clone();
+    spawn_with_cancel::<&'static str>(
+        debug_span!(parent: span, "completion_watcher"),
+        "completion_watcher",
+        token,
+        async move {
+            live.wait_until_completed().await;
+            // No longer need to keep the live state alive.
+            drop(live);
+            let Some(state) = state.upgrade() else {
+                return Ok(());
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if state.set_finished_at_if_unset(now) {
+                session.try_update_persistence_metadata(&state).await;
             }
             Ok(())
         },

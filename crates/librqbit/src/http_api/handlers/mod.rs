@@ -13,6 +13,7 @@ use axum::response::Redirect;
 
 use axum::{
     Router,
+    extract::State,
     response::IntoResponse,
     routing::{get, post},
 };
@@ -22,7 +23,7 @@ use super::HttpApi;
 type ApiState = Arc<HttpApi>;
 
 #[allow(unused_variables)]
-async fn h_api_root(parts: Parts) -> impl IntoResponse {
+async fn h_api_root(State(state): State<ApiState>, parts: Parts) -> impl IntoResponse {
     // If browser, and webui enabled, redirect to web
     #[cfg(feature = "webui")]
     {
@@ -66,10 +67,12 @@ async fn h_api_root(parts: Parts) -> impl IntoResponse {
             "POST /torrents/{id_or_infohash}/delete": "Forget about the torrent, remove the files",
             "POST /torrents/{id_or_infohash}/add_peers": "Add peers (newline-delimited)",
             "POST /torrents/{id_or_infohash}/update_only_files": "Change the selection of files to download. You need to POST json of the following form {\"only_files\": [0, 1, 2]}",
+            "POST /torrents/{id_or_infohash}/update_tags": "Set the torrent's tags/labels. POST json of the form {\"tags\": [\"foo\", \"bar\"]}",
             "POST /rust_log": "Set RUST_LOG to this post launch (for debugging)",
         },
         "server": "rqbit",
         "version": env!("CARGO_PKG_VERSION"),
+        "default_output_folder": state.api.session().output_folder().to_string_lossy(),
     });
 
     ([("Content-Type", "application/json")], axum::Json(json)).into_response()
@@ -133,6 +136,10 @@ pub fn make_api_router(state: ApiState) -> Router {
             .route(
                 "/torrents/{id}/update_only_files",
                 post(torrents::h_torrent_action_update_only_files),
+            )
+            .route(
+                "/torrents/{id}/update_tags",
+                post(torrents::h_torrent_action_update_tags),
             )
             .route("/torrents/{id}/add_peers", post(torrents::h_add_peers))
             .route("/torrents/create", post(torrents::h_create_torrent));

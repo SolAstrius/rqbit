@@ -248,6 +248,23 @@ pub async fn h_torrent_action_update_only_files(
         .map(axum::Json)
 }
 
+#[derive(Deserialize)]
+pub struct UpdateTagsRequest {
+    tags: Vec<String>,
+}
+
+pub async fn h_torrent_action_update_tags(
+    State(state): State<ApiState>,
+    Path(idx): Path<TorrentIdOrHash>,
+    axum::Json(req): axum::Json<UpdateTagsRequest>,
+) -> Result<impl IntoResponse> {
+    state
+        .api
+        .api_torrent_action_update_tags(idx, req.tags.into_iter().collect())
+        .await
+        .map(axum::Json)
+}
+
 pub async fn h_session_stats(State(state): State<ApiState>) -> impl IntoResponse {
     axum::Json(state.api.api_session_stats())
 }

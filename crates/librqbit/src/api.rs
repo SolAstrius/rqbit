@@ -224,6 +224,7 @@ impl Api {
                             .to_string_lossy()
                             .into_owned(),
                         total_pieces,
+                        tags: mgr.tags().into_iter().collect(),
 
                         // These will be filled in /details and /stats endpoints
                         files: None,
@@ -250,14 +251,16 @@ impl Api {
             .to_string_lossy()
             .into_owned()
             .to_string();
-        make_torrent_details(
+        let mut details = make_torrent_details(
             Some(handle.id()),
             &info_hash,
             handle.metadata.load().as_ref().map(|r| &r.info),
             handle.name().as_deref(),
             only_files.as_deref(),
             output_folder,
-        )
+        )?;
+        details.tags = handle.tags().into_iter().collect();
+        Ok(details)
     }
 
     pub fn api_session_stats(&self) -> SessionStatsSnapshot {
@@ -344,6 +347,19 @@ impl Api {
             .update_only_files(&handle, only_files)
             .await
             .context("error updating only_files")?;
+        Ok(Default::default())
+    }
+
+    pub async fn api_torrent_action_update_tags(
+        &self,
+        idx: TorrentIdOrHash,
+        tags: HashSet<String>,
+    ) -> Result<EmptyJsonResponse> {
+        let handle = self.mgr_handle(idx)?;
+        self.session
+            .update_tags(&handle, tags)
+            .await
+            .context("error updating tags")?;
         Ok(Default::default())
     }
 
@@ -543,6 +559,11 @@ pub struct TorrentDetailsResponse {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<TorrentDetailsResponseFile>>,
+
+    /// User-assigned tags/labels (e.g. categories for download-client integrations).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
     #[serde(skip_serializing_if = "Option::is_none", skip_deserializing)]
     pub stats: Option<TorrentStats>,
 }
@@ -592,6 +613,7 @@ fn make_torrent_details(
         files: Some(files),
         output_folder,
         total_pieces,
+        tags: Vec::new(),
         stats: None,
     })
 }

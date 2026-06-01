@@ -30,6 +30,10 @@ pub struct SerializedTorrent {
     output_folder: PathBuf,
     only_files: Option<Vec<usize>>,
     is_paused: bool,
+    #[serde(default)]
+    tags: HashSet<String>,
+    #[serde(default)]
+    finished_at: Option<u64>,
 }
 
 impl SerializedTorrent {
@@ -59,6 +63,12 @@ impl SerializedTorrent {
             ),
             only_files: self.only_files,
             overwrite: true,
+            tags: if self.tags.is_empty() {
+                None
+            } else {
+                Some(self.tags.into_iter().collect())
+            },
+            finished_at: self.finished_at,
             ..Default::default()
         };
 

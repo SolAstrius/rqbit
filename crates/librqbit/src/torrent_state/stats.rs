@@ -75,6 +75,18 @@ pub struct TorrentStats {
     pub uploaded_bytes: u64,
     pub total_bytes: u64,
     pub finished: bool,
+    /// Upload/download ratio (uploaded_bytes / progress_bytes), 0 if nothing downloaded yet.
+    /// Provided so API consumers don't have to recompute it (and divide-by-zero).
+    pub ratio: f64,
+    /// Estimated seconds until completion, if known. Mirrors `live.time_remaining` as a
+    /// plain number so consumers don't have to parse a human-readable string, and is
+    /// present regardless of which state field carries the estimate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_seconds: Option<u64>,
+    /// Unix timestamp (seconds) at which the torrent finished downloading, if known.
+    /// Enables seed-time based removal in downstream clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<u64>,
     pub live: Option<LiveStats>,
 }
 
@@ -151,6 +163,12 @@ fn format_seconds_to_time(seconds: u64, f: &mut core::fmt::Formatter<'_>) -> cor
 
 pub struct DurationWithHumanReadable(Duration);
 
+impl DurationWithHumanReadable {
+    pub fn as_secs(&self) -> u64 {
+        self.0.as_secs()
+    }
+}
+
 impl core::fmt::Display for DurationWithHumanReadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> core::fmt::Result {
         format_seconds_to_time(self.0.as_secs(), f)
@@ -223,10 +241,13 @@ impl Serialize for Speed {
         #[derive(Serialize)]
         struct Tmp {
             mbps: f64,
+            // Plain bytes/sec, so consumers don't have to convert from mbps.
+            bytes: u64,
             human_readable: String,
         }
         Tmp {
             mbps: self.mbps,
+            bytes: self.as_bytes(),
             human_readable: self.to_string(),
         }
         .serialize(serializer)

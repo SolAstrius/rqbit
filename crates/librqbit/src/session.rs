@@ -311,6 +311,15 @@ pub struct AddTorrentOptions {
 
     // Custom trackers
     pub trackers: Option<Vec<String>>,
+
+    /// Tags/labels to assign to the torrent. Used to restore the session from serialized state.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+
+    /// Unix timestamp (seconds) at which the torrent finished downloading.
+    /// Used to restore the session from serialized state.
+    #[serde(default)]
+    pub finished_at: Option<u64>,
 }
 
 pub struct ListOnlyResponse {
@@ -537,6 +546,11 @@ impl Session {
 
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
+    }
+
+    /// The session's default output folder, where torrents are downloaded unless overridden.
+    pub fn output_folder(&self) -> &Path {
+        &self.output_folder
     }
 
     pub fn client_name_and_version(&self) -> &str {
@@ -1514,6 +1528,8 @@ impl Session {
                     paused: opts.paused,
                     state: ManagedTorrentState::Initializing(initializing),
                     only_files,
+                    finished_at: opts.finished_at,
+                    tags: opts.tags.clone().unwrap_or_default().into_iter().collect(),
                 }),
                 state_change_notify: Notify::new(),
                 shared: minfo,
@@ -1731,7 +1747,7 @@ impl Session {
         )
     }
 
-    async fn try_update_persistence_metadata(&self, handle: &ManagedTorrentHandle) {
+    pub(crate) async fn try_update_persistence_metadata(&self, handle: &ManagedTorrentHandle) {
         if let Some(p) = self.persistence.as_ref()
             && let Err(e) = p.update_metadata(handle.id(), handle).await
         {
@@ -1759,6 +1775,17 @@ impl Session {
     ) -> anyhow::Result<()> {
         handle.update_only_files(only_files)?;
         self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    pub async fn update_tags(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+        tags: HashSet<String>,
+    ) -> anyhow::Result<()> {
+        if handle.set_tags(tags) {
+            self.try_update_persistence_metadata(handle).await;
+        }
         Ok(())
     }
 
