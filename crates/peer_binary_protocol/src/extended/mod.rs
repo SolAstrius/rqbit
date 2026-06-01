@@ -11,14 +11,16 @@ use ut_pex::UtPex;
 
 use crate::DoubleBufHelper;
 use crate::MSGID_EXTENDED;
+use crate::MY_EXTENDED_UT_HOLEPUNCH;
 use crate::MY_EXTENDED_UT_PEX;
 use crate::SerializeError;
 
-use self::{handshake::ExtendedHandshake, ut_metadata::UtMetadata};
+use self::{handshake::ExtendedHandshake, ut_holepunch::UtHolepunch, ut_metadata::UtMetadata};
 
 use super::MessageDeserializeError;
 
 pub mod handshake;
+pub mod ut_holepunch;
 pub mod ut_metadata;
 pub mod ut_pex;
 
@@ -28,6 +30,8 @@ use super::MY_EXTENDED_UT_METADATA;
 pub struct PeerExtendedMessageIds {
     pub ut_metadata: Option<u8>,
     pub ut_pex: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ut_holepunch: Option<u8>,
 }
 
 impl PeerExtendedMessageIds {
@@ -35,6 +39,7 @@ impl PeerExtendedMessageIds {
         Self {
             ut_metadata: Some(MY_EXTENDED_UT_METADATA),
             ut_pex: Some(MY_EXTENDED_UT_PEX),
+            ut_holepunch: Some(MY_EXTENDED_UT_HOLEPUNCH),
         }
     }
 }
@@ -44,6 +49,7 @@ pub enum ExtendedMessage<ByteBuf: ByteBufT> {
     Handshake(ExtendedHandshake<ByteBuf>),
     UtMetadata(UtMetadata<ByteBuf>),
     UtPex(UtPex<ByteBuf>),
+    UtHolepunch(UtHolepunch),
     Dyn(u8, BencodeValue<ByteBuf>),
 }
 
@@ -77,6 +83,13 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 out.write_u8(emsg_id)?;
                 bencode_serialize_to_writer(m, &mut out)?;
             }
+            ExtendedMessage::UtHolepunch(h) => {
+                let emsg_id = peer_extended_msg_ids()
+                    .ut_holepunch
+                    .ok_or(SerializeError::NeedUtHolepunch)?;
+                out.write_u8(emsg_id)?;
+                h.serialize(&mut out)?;
+            }
         }
         Ok(out.position() as usize)
     }
@@ -106,6 +119,9 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 Ok(ExtendedMessage::UtMetadata(UtMetadata::deserialize(buf)?))
             }
             MY_EXTENDED_UT_PEX => Ok(ExtendedMessage::UtPex(from_bytes_contig(&buf)?)),
+            MY_EXTENDED_UT_HOLEPUNCH => {
+                Ok(ExtendedMessage::UtHolepunch(UtHolepunch::deserialize(buf)?))
+            }
             _ => Ok(ExtendedMessage::Dyn(emsg_id, from_bytes_contig(&buf)?)),
         }
     }
