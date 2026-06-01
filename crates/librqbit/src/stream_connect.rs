@@ -717,6 +717,23 @@ impl StreamConnector {
         }
 
         if let Some(proxy) = self.proxy_config.as_ref() {
+            // uTP-over-SOCKS configured AND TCP connect disabled => uTP only. Lets
+            // `--disable-tcp-connect --experimental-utp-over-socks` force every
+            // outbound peer over uTP, which is how we measure it in isolation (a
+            // healthy swarm otherwise wins the SOCKS-TCP arm of the race below
+            // every time, so uTP would never actually run).
+            if !self.enable_tcp
+                && let Some(usock) = self.utp_socket_socks.clone()
+            {
+                let conn = self
+                    .with_stat(ConnectionKind::Utp, addr.is_ipv6(), usock.connect(addr))
+                    .await
+                    .map_err(Error::UtpConnect)?;
+                debug!(?addr, "connected over uTP-over-SOCKS (tcp connect disabled)");
+                let (r, w) = conn.split();
+                return Ok((ConnectionKind::Utp, Box::new(r), Box::new(w)));
+            }
+
             // Primary: SOCKS5 TCP CONNECT (mature, simple).
             let socks_tcp = async {
                 let (r, w) = self
