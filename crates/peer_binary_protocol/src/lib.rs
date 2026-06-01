@@ -248,7 +248,9 @@ pub enum SerializeError {
     NeedUtMetadata,
     #[error("need peer's handshake to serialize ut_pex, or peer does't support ut_pex")]
     NeedPex,
-    #[error("need peer's handshake to serialize ut_holepunch, or peer doesn't support ut_holepunch")]
+    #[error(
+        "need peer's handshake to serialize ut_holepunch, or peer doesn't support ut_holepunch"
+    )]
     NeedUtHolepunch,
 }
 

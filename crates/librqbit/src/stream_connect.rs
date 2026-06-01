@@ -664,6 +664,13 @@ impl StreamConnector {
         self.encryption
     }
 
+    /// Whether outbound uTP is available (direct or relayed through SOCKS). Used to
+    /// decide whether to advertise `ut_holepunch` — punching requires dialing the
+    /// peer back over uTP, so without it the extension would be a false promise.
+    pub fn has_utp(&self) -> bool {
+        self.utp_socket.is_some() || self.utp_socket_socks.is_some()
+    }
+
     fn get_stat(&self, kind: ConnectionKind, is_v6: bool) -> &SingleStatAtomic {
         let stat = match kind {
             ConnectionKind::Tcp => &self.stats.tcp,
@@ -741,7 +748,10 @@ impl StreamConnector {
                     .with_stat(ConnectionKind::Utp, addr.is_ipv6(), usock.connect(addr))
                     .await
                     .map_err(Error::UtpConnect)?;
-                debug!(?addr, "connected over uTP-over-SOCKS (tcp connect disabled)");
+                debug!(
+                    ?addr,
+                    "connected over uTP-over-SOCKS (tcp connect disabled)"
+                );
                 let (r, w) = conn.split();
                 return Ok((ConnectionKind::Utp, Box::new(r), Box::new(w)));
             }

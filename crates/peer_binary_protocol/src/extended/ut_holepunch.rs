@@ -117,9 +117,15 @@ mod tests {
         roundtrip(UtHolepunch::Rendezvous(
             (Ipv4Addr::new(1, 2, 3, 4), 6881).into(),
         ));
-        roundtrip(UtHolepunch::Connect((Ipv4Addr::new(9, 8, 7, 6), 51413).into()));
         roundtrip(UtHolepunch::Connect(
-            (Ipv6Addr::new(0x2a03, 0x1b20, 4, 0xf011, 0, 0, 0, 0xa02e), 1234).into(),
+            (Ipv4Addr::new(9, 8, 7, 6), 51413).into(),
+        ));
+        roundtrip(UtHolepunch::Connect(
+            (
+                Ipv6Addr::new(0x2a03, 0x1b20, 4, 0xf011, 0, 0, 0, 0xa02e),
+                1234,
+            )
+                .into(),
         ));
         roundtrip(UtHolepunch::Error {
             target: (Ipv4Addr::new(5, 5, 5, 5), 80).into(),

@@ -72,6 +72,7 @@ use peer_binary_protocol::{
     extended::{
         self, ExtendedMessage,
         handshake::ExtendedHandshake,
+        ut_holepunch::UtHolepunch,
         ut_metadata::{UtMetadata, UtMetadataData},
         ut_pex::UtPex,
     },
@@ -1117,6 +1118,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                     self.on_pex_message(pex);
                 }
             }
+            Message::Extended(ExtendedMessage::UtHolepunch(hp)) => {
+                self.on_holepunch_message(hp);
+            }
             message => {
                 warn!(
                     id = self.state.shared.id,
@@ -1225,6 +1229,14 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             && let Ok(len) = info_bytes.len().try_into()
         {
             handshake.metadata_size = Some(len);
+        }
+
+        // Only advertise ut_holepunch if we can actually punch — i.e. dial the peer
+        // back over uTP. Without an outbound uTP transport the connect-back would go
+        // over TCP and never open the UDP pinhole, so claiming support would be a
+        // false promise to rendezvous peers.
+        if !self.state.shared.connector.has_utp() {
+            handshake.m.ut_holepunch = None;
         }
 
         Ok(())
@@ -2017,6 +2029,37 @@ impl PeerHandler {
                     })
                     .ok();
             });
+    }
+
+    // Minimal BEP-55 responder: we play the "target" role only. On `connect`, a
+    // rendezvous peer is telling us to dial `target` now — doing so over uTP opens
+    // our NAT pinhole and completes the hole punch (the existing outbound path
+    // selects uTP since a NATed initiator is unreachable over SOCKS-TCP). We do not
+    // yet act as a rendezvous (relay) or initiator.
+    fn on_holepunch_message(&self, msg: UtHolepunch) {
+        match msg {
+            UtHolepunch::Connect(target) => {
+                trace!(?target, "ut_holepunch: connect, dialing target to punch");
+                if let Err(error) = self.state.add_peer_if_not_seen(target) {
+                    debug!(
+                        ?target,
+                        "ut_holepunch: failed to queue connect-back: {error:#}"
+                    );
+                }
+            }
+            UtHolepunch::Rendezvous(target) => {
+                trace!(
+                    ?target,
+                    "ut_holepunch: rendezvous received; relay role not implemented, ignoring"
+                );
+            }
+            UtHolepunch::Error { target, err_code } => {
+                debug!(
+                    ?target,
+                    err_code, "ut_holepunch: error from rendezvous peer"
+                );
+            }
+        }
     }
 
     fn lock_read(
