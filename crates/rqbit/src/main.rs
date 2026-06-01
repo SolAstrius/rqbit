@@ -1088,6 +1088,19 @@ async fn start_http_api(
 
 async fn stats_printer(session: Arc<Session>) -> Result<(), &'static str> {
     loop {
+        // Connection breakdown by transport, surfaced at INFO so uTP-over-SOCKS
+        // activity is visible without RUST_LOG=debug tracing. successes/attempts
+        // (err) per kind; live peer counts per kind.
+        let cs = session.stats_snapshot();
+        let c = &cs.connections;
+        let utp_att = c.utp.v4.attempts + c.utp.v6.attempts;
+        let utp_succ = c.utp.v4.successes + c.utp.v6.successes;
+        let utp_err = c.utp.v4.errors + c.utp.v6.errors;
+        let socks_att = c.socks.v4.attempts + c.socks.v6.attempts;
+        let socks_succ = c.socks.v4.successes + c.socks.v6.successes;
+        let socks_err = c.socks.v4.errors + c.socks.v6.errors;
+        let (live_tcp, live_utp, live_socks) =
+            (cs.peers.live_tcp, cs.peers.live_utp, cs.peers.live_socks);
         session.with_torrents(|torrents| {
                 // Per-torrent detail is logged at DEBUG (it's far too verbose for
                 // INFO with many torrents - hundreds of lines/sec drowns the log).
@@ -1156,7 +1169,7 @@ async fn stats_printer(session: Arc<Session>) -> Result<(), &'static str> {
                     100f64
                 };
                 info!(
-                    "{} torrents: {} live, {} initializing, {} idle; {:.1}% complete; ↓{:.2} MiB/s ↑{:.2} MiB/s",
+                    "{} torrents: {} live, {} initializing, {} idle; {:.1}% complete; ↓{:.2} MiB/s ↑{:.2} MiB/s; live peers[tcp={} utp={} socks={}]; conn[utp {}/{} err{} · socks {}/{} err{}]",
                     n_total,
                     n_live,
                     n_init,
@@ -1164,6 +1177,9 @@ async fn stats_printer(session: Arc<Session>) -> Result<(), &'static str> {
                     overall_pct,
                     down_mbps,
                     up_mbps,
+                    live_tcp, live_utp, live_socks,
+                    utp_succ, utp_att, utp_err,
+                    socks_succ, socks_att, socks_err,
                 );
             });
         tokio::time::sleep(Duration::from_secs(1)).await;
