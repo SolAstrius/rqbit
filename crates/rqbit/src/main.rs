@@ -521,7 +521,16 @@ fn api_socket_from_systemd() -> anyhow::Result<Option<TcpListener>> {
     Ok(Some(TcpListener::try_from(listen_fd)?))
 }
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() -> anyhow::Result<()> {
+    // Explicitly dropped after block_on (main ends in std::process::exit, which
+    // runs no destructors) to write dhat-heap.json while the session is still live.
+    #[cfg(feature = "dhat-heap")]
+    let dhat_profiler = dhat::Profiler::new_heap();
+
     let opts = Opts::parse();
 
     if let SubCommand::Completions(completions_opts) = &opts.subcommand {
@@ -588,6 +597,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     let result = rt.block_on(async_main(opts, token.clone()));
+    // Write the heap profile now, before the runtime/session teardown and the
+    // process::exit below (which would otherwise skip the Profiler's Drop).
+    #[cfg(feature = "dhat-heap")]
+    drop(dhat_profiler);
     if let Err(e) = result.as_ref() {
         error!("error running rqbit: {e:?}");
     }

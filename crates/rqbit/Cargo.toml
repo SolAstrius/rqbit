@@ -23,6 +23,8 @@ rust-tls = ["librqbit/rust-tls"]
 debug_slow_disk = ["librqbit/storage_middleware"]
 postgres = ["librqbit/postgres"]
 disable-upload = ["librqbit/disable-upload"]
+# Heap-profile the binary with dhat (writes dhat-heap.json on clean exit). Dev-only.
+dhat-heap = ["dep:dhat"]
 _disable_disk_write_net_benchmark = [
     "librqbit/_disable_disk_write_net_benchmark",
 ]
@@ -37,6 +39,7 @@ librqbit = { workspace = true, features = [
 ] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 console-subscriber = { workspace = true, optional = true }
+dhat = { version = "0.3", optional = true }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive", "deprecated", "env"] }
 clap_complete.workspace = true
