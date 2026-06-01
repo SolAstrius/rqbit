@@ -17,7 +17,8 @@ gen_stats!(SessionCountersAtomic SessionCountersSnapshot, [
     uploaded_bytes u64,
     blocked_incoming u64,
     blocked_outgoing u64,
-    holepunch_connects u64
+    holepunch_connects u64,
+    holepunch_success u64
 ], []);
 
 pub struct SessionStats {

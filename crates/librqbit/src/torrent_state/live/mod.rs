@@ -200,6 +200,10 @@ pub struct TorrentStateLive {
     // hole-punch dials a longer window than the default peer connect timeout).
     peer_queue_tx: UnboundedSender<(SocketAddr, Option<Duration>)>,
 
+    // Addrs we dialed in response to a ut_holepunch `connect`. When one of these
+    // goes live it's a confirmed completed hole punch (counted as holepunch_success).
+    holepunch_dials: dashmap::DashSet<SocketAddr>,
+
     finished_notify: Notify,
     new_pieces_notify: Notify,
 
@@ -286,6 +290,7 @@ impl TorrentStateLive {
             )),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
+            holepunch_dials: Default::default(),
             finished_notify: Notify::new(),
             down_speed_estimator,
             up_speed_estimator,
@@ -718,6 +723,13 @@ impl TorrentStateLive {
         self.peers.with_peer_mut(handle, "set_peer_live", |p| {
             p.connecting_to_live(h.peer_id, &self.peers, connection_kind);
         });
+        // If this addr was a ut_holepunch dial, it just completed — a confirmed punch.
+        if self.holepunch_dials.remove(&handle).is_some() {
+            self.session_stats
+                .counters
+                .holepunch_success
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn get_uploaded_bytes(&self) -> u64 {
@@ -2074,6 +2086,8 @@ impl PeerHandler {
                     .counters
                     .holepunch_connects
                     .fetch_add(1, Ordering::Relaxed);
+                // Mark this dial so we can count it as a confirmed punch if it goes live.
+                self.state.holepunch_dials.insert(target);
                 if let Err(error) = self.state.add_peer_if_not_seen_with_connect_timeout(
                     target,
                     Some(HOLEPUNCH_CONNECT_TIMEOUT),

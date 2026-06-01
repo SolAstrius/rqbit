@@ -1189,7 +1189,7 @@ async fn stats_printer(session: Arc<Session>) -> Result<(), &'static str> {
                     100f64
                 };
                 info!(
-                    "{} torrents: {} live, {} initializing, {} idle; {:.1}% complete; ↓{:.2} MiB/s ↑{:.2} MiB/s; live peers[tcp={} utp={} socks={}]; conn[utp {}/{} err{} · socks {}/{} err{}]; holepunch_in={}",
+                    "{} torrents: {} live, {} initializing, {} idle; {:.1}% complete; ↓{:.2} MiB/s ↑{:.2} MiB/s; live peers[tcp={} utp={} socks={}]; conn[utp {}/{} err{} · socks {}/{} err{}]; holepunch[in={} ok={}]",
                     n_total,
                     n_live,
                     n_init,
@@ -1201,6 +1201,7 @@ async fn stats_printer(session: Arc<Session>) -> Result<(), &'static str> {
                     utp_succ, utp_att, utp_err,
                     socks_succ, socks_att, socks_err,
                     cs.counters.holepunch_connects,
+                    cs.counters.holepunch_success,
                 );
             });
         tokio::time::sleep(Duration::from_secs(1)).await;
