@@ -92,6 +92,9 @@ pub(crate) struct StreamConnectorArgs {
     pub utp_socket_socks: Option<Arc<SocksUtpSocket>>,
     /// Head start for TCP over uTP in the outbound connection race. `None` => 1s.
     pub utp_race_delay: Option<Duration>,
+    /// STUN-discovered external (Mullvad-exit) mapping of the uTP-over-SOCKS
+    /// association, for announcing ourselves and the handshake `p` field.
+    pub utp_external_addr: Option<SocketAddr>,
     pub bind_device: Option<BindDevice>,
     pub ipv4_only: bool,
     pub encryption: Encryption,
@@ -279,6 +282,79 @@ fn target_addr_to_socket_addr(ta: TargetAddr) -> std::io::Result<SocketAddr> {
     }
 }
 
+// Public STUN servers, tried in order, to discover our external mapping.
+const STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
+const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+
+// Best-effort: send a STUN binding request through `dgram` (the SOCKS5 UDP relay)
+// and parse the reflected XOR-MAPPED-ADDRESS, i.e. our external (Mullvad-exit)
+// ip:port for this association. Returns None on any failure.
+async fn stun_discover_external(
+    dgram: &Socks5Datagram<tokio::net::TcpStream>,
+) -> Option<SocketAddr> {
+    // 20-byte STUN binding request, no attributes. Fixed transaction id is fine: we
+    // do a single request/response on a freshly-bound association with nothing else
+    // using it yet.
+    let mut req = Vec::with_capacity(20);
+    req.extend_from_slice(&0x0001u16.to_be_bytes()); // type: binding request
+    req.extend_from_slice(&0x0000u16.to_be_bytes()); // length: 0
+    req.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    req.extend_from_slice(b"rqbit-utp-01"); // 12-byte transaction id
+
+    for server in STUN_SERVERS {
+        let stun_addr = match tokio::net::lookup_host(*server).await {
+            Ok(addrs) => addrs.into_iter().find(|a| a.is_ipv4()),
+            Err(_) => None,
+        };
+        let Some(stun_addr) = stun_addr else { continue };
+        if dgram.send_to(&req, stun_addr).await.is_err() {
+            continue;
+        }
+        let mut buf = [0u8; 256];
+        if let Ok(Ok((n, _src))) =
+            tokio::time::timeout(Duration::from_secs(5), dgram.recv_from(&mut buf)).await
+            && let Some(addr) = parse_stun_mapped_address(&buf[..n])
+        {
+            return Some(addr);
+        }
+    }
+    None
+}
+
+// Parse a STUN binding response, returning the (XOR-)MAPPED-ADDRESS if present (v4).
+fn parse_stun_mapped_address(data: &[u8]) -> Option<SocketAddr> {
+    if data.len() < 20 {
+        return None;
+    }
+    let magic = STUN_MAGIC_COOKIE.to_be_bytes();
+    let mut pos = 20; // skip 20-byte header
+    while pos + 4 <= data.len() {
+        let atype = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let alen = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        let val_start = pos + 4;
+        if val_start + alen > data.len() {
+            break;
+        }
+        let val = &data[val_start..val_start + alen];
+        pos = val_start + alen + (4 - (alen % 4)) % 4; // attributes are 4-byte aligned
+
+        // 0x0020 = XOR-MAPPED-ADDRESS, 0x0001 = MAPPED-ADDRESS. family 0x01 = IPv4.
+        let xor = atype == 0x0020;
+        if (xor || atype == 0x0001) && val.len() >= 8 && val[1] == 0x01 {
+            let mut port = u16::from_be_bytes([val[2], val[3]]);
+            let mut ip = [val[4], val[5], val[6], val[7]];
+            if xor {
+                port ^= (STUN_MAGIC_COOKIE >> 16) as u16;
+                for i in 0..4 {
+                    ip[i] ^= magic[i];
+                }
+            }
+            return Some(SocketAddr::from((Ipv4Addr::from(ip), port)));
+        }
+    }
+    None
+}
+
 impl SocksUdpSocket {
     // Rebuild the SOCKS5 UDP association in place. De-duplicated so concurrent
     // triggers from the send and recv paths don't stack up rebuilds.
@@ -417,6 +493,13 @@ pub(crate) struct SocksUtpTransport {
     // purpose: NEVER hold the guard across `.await` — clone the Arc and drop it.
     inner: StdRwLock<Arc<Socks5Datagram<tokio::net::TcpStream>>>,
     bind_addr: SocketAddr,
+    // Our external (post-NAT, i.e. Mullvad-exit) mapping for THIS association, as
+    // discovered via STUN at construction. This is the ip:port a peer must send to
+    // for inbound uTP to reach us — used to announce ourselves (DHT/tracker) and in
+    // the extended handshake `p` field, so hole-punch coordination targets the right
+    // endpoint. `None` if STUN failed. NOTE: only probed once; a reassociation
+    // changes the external port and would make this stale (re-probe is future work).
+    external_addr: Option<SocketAddr>,
     // Set on send, cleared on receive. If a recv idles out while set, we sent into
     // the void and the relay is presumed dead.
     sent_since_recv: std::sync::atomic::AtomicBool,
@@ -430,14 +513,29 @@ impl SocksUtpTransport {
         bind_device: Option<BindDevice>,
     ) -> Result<Self> {
         let (dgram, bind_addr) = proxy.bind_udp_datagram(bind_device.as_ref()).await?;
+        // Best-effort STUN probe on this very association so the discovered mapping
+        // matches the port our uTP traffic egresses from. Done before the datagram
+        // is handed to the UtpSocket (which then owns recv), so no interception is
+        // needed. Failure is non-fatal (we just won't announce a uTP endpoint).
+        let external_addr = stun_discover_external(&dgram).await;
+        match external_addr {
+            Some(a) => info!(external = %a, "discovered uTP-over-SOCKS external mapping via STUN"),
+            None => debug!("could not discover uTP-over-SOCKS external mapping via STUN"),
+        }
         Ok(Self {
             proxy,
             bind_device,
             inner: StdRwLock::new(Arc::new(dgram)),
             bind_addr,
+            external_addr,
             sent_since_recv: std::sync::atomic::AtomicBool::new(false),
             reassociating: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// The STUN-discovered external (Mullvad-exit) mapping for this association.
+    pub(crate) fn external_addr(&self) -> Option<SocketAddr> {
+        self.external_addr
     }
 
     fn current(&self) -> Arc<Socks5Datagram<tokio::net::TcpStream>> {
@@ -625,6 +723,7 @@ pub(crate) struct StreamConnector {
     utp_socket: Option<Arc<librqbit_utp::UtpSocketUdp>>,
     utp_socket_socks: Option<Arc<SocksUtpSocket>>,
     utp_race_delay: Duration,
+    utp_external_addr: Option<SocketAddr>,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
     encryption: Encryption,
@@ -652,6 +751,7 @@ impl StreamConnector {
             utp_socket: config.utp_socket,
             utp_socket_socks: config.utp_socket_socks,
             utp_race_delay: config.utp_race_delay.unwrap_or(DEFAULT_UTP_RACE_DELAY),
+            utp_external_addr: config.utp_external_addr,
             bind_device: config.bind_device,
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
@@ -669,6 +769,11 @@ impl StreamConnector {
     /// peer back over uTP, so without it the extension would be a false promise.
     pub fn has_utp(&self) -> bool {
         self.utp_socket.is_some() || self.utp_socket_socks.is_some()
+    }
+
+    /// STUN-discovered external uTP port to advertise (announce + handshake `p`), if any.
+    pub fn utp_external_port(&self) -> Option<u16> {
+        self.utp_external_addr.map(|a| a.port())
     }
 
     fn get_stat(&self, kind: ConnectionKind, is_v6: bool) -> &SingleStatAtomic {

@@ -1257,6 +1257,12 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             handshake.m.ut_holepunch = None;
         }
 
+        // Advertise our STUN-discovered external uTP port so the peer (and any
+        // rendezvous it acts as) knows the endpoint to reach/punch us at.
+        if let Some(port) = self.state.shared.connector.utp_external_port() {
+            handshake.p = Some(port as u32);
+        }
+
         Ok(())
     }
 

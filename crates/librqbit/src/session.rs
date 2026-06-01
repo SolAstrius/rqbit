@@ -745,7 +745,8 @@ impl Session {
             // default (see ConnectionOptions::experimental_utp_over_socks). Builds a
             // dedicated, self-healing UDP ASSOCIATE just for uTP, mirroring the DHT
             // socket injection above.
-            let utp_socket_socks = {
+            // Returns (the uTP-over-SOCKS socket, its STUN-discovered external mapping).
+            let (utp_socket_socks, utp_external_addr) = {
                 let enabled = opts
                     .connect
                     .as_ref()
@@ -760,6 +761,9 @@ impl Session {
                         .await
                         {
                             Ok(transport) => {
+                                // Capture the STUN-discovered mapping before the
+                                // transport is moved into the UtpSocket.
+                                let external = transport.external_addr();
                                 let utp_opts = librqbit_utp::SocketOpts {
                                     cancellation_token: token.child_token(),
                                     dont_wait_for_lastack: true,
@@ -775,21 +779,21 @@ impl Session {
                                         info!(
                                             "enabled experimental uTP-over-SOCKS for outbound peers"
                                         );
-                                        Some(s)
+                                        (Some(s), external)
                                     }
                                     Err(e) => {
                                         warn!("couldn't create uTP-over-SOCKS socket: {e:#}");
-                                        None
+                                        (None, None)
                                     }
                                 }
                             }
                             Err(e) => {
                                 warn!("couldn't establish uTP-over-SOCKS association: {e:#}");
-                                None
+                                (None, None)
                             }
                         }
                     }
-                    _ => None,
+                    _ => (None, None),
                 }
             };
 
@@ -800,6 +804,7 @@ impl Session {
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     utp_socket_socks,
                     utp_race_delay: opts.connect.as_ref().and_then(|c| c.utp_race_delay),
+                    utp_external_addr,
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
                     encryption: opts
@@ -886,7 +891,13 @@ impl Session {
                 db: RwLock::new(Default::default()),
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
-                announce_port: listen_result.as_ref().and_then(|l| l.announce_port),
+                // Prefer the STUN-discovered uTP-over-SOCKS external port so peers/
+                // rendezvous learn the endpoint they should hole-punch toward (the
+                // exit IP is implied by our DHT/tracker query source — same Mullvad
+                // exit). Falls back to the listener's announce port.
+                announce_port: utp_external_addr
+                    .map(|a| a.port())
+                    .or_else(|| listen_result.as_ref().and_then(|l| l.announce_port)),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
