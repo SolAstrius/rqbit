@@ -196,7 +196,9 @@ pub struct TorrentStateLive {
     peer_semaphore: Arc<Semaphore>,
 
     // The queue for peer manager to connect to them.
-    peer_queue_tx: UnboundedSender<SocketAddr>,
+    // The optional Duration is a per-dial connect-timeout override (used to give
+    // hole-punch dials a longer window than the default peer connect timeout).
+    peer_queue_tx: UnboundedSender<(SocketAddr, Option<Duration>)>,
 
     finished_notify: Notify,
     new_pieces_notify: Notify,
@@ -530,6 +532,7 @@ impl TorrentStateLive {
         self: Arc<Self>,
         addr: SocketAddr,
         permit: OwnedSemaphorePermit,
+        connect_timeout_override: Option<Duration>,
     ) -> crate::Result<()> {
         let state = self;
         let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
@@ -555,7 +558,9 @@ impl TorrentStateLive {
         let _token_guard = handler.cancel_token.clone().drop_guard();
 
         let options = PeerConnectionOptions {
-            connect_timeout: state.shared.options.peer_connect_timeout,
+            connect_timeout: connect_timeout_override
+                .map(Some)
+                .unwrap_or(state.shared.options.peer_connect_timeout),
             read_write_timeout: state.shared.options.peer_read_write_timeout,
             ..Default::default()
         };
@@ -604,7 +609,7 @@ impl TorrentStateLive {
 
     async fn task_peer_adder(
         self: Arc<Self>,
-        mut peer_queue_rx: UnboundedReceiver<SocketAddr>,
+        mut peer_queue_rx: UnboundedReceiver<(SocketAddr, Option<Duration>)>,
     ) -> crate::Result<()> {
         let state = self;
         // Startup gate: during the initial persistence reload, hold off on connecting
@@ -618,7 +623,8 @@ impl TorrentStateLive {
             }
         }
         loop {
-            let addr = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
+            let (addr, connect_timeout_override) =
+                peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
             if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
                 debug!(?addr, "ignoring peer as we are finished");
                 state.peers.mark_peer_not_needed(addr);
@@ -669,7 +675,11 @@ impl TorrentStateLive {
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
+                aframe!(state.clone().task_manage_outgoing_peer(
+                    addr,
+                    permit,
+                    connect_timeout_override
+                )),
             );
         }
     }
@@ -735,13 +745,21 @@ impl TorrentStateLive {
     }
 
     pub(crate) fn add_peer_if_not_seen(&self, addr: SocketAddr) -> crate::Result<bool> {
+        self.add_peer_if_not_seen_with_connect_timeout(addr, None)
+    }
+
+    pub(crate) fn add_peer_if_not_seen_with_connect_timeout(
+        &self,
+        addr: SocketAddr,
+        connect_timeout: Option<Duration>,
+    ) -> crate::Result<bool> {
         match self.peers.add_if_not_seen(addr) {
             Some(handle) => handle,
             None => return Ok(false),
         };
 
         self.peer_queue_tx
-            .send(addr)
+            .send((addr, connect_timeout))
             .ok()
             .ok_or(Error::TorrentIsNotLive)?;
         Ok(true)
@@ -917,7 +935,7 @@ impl TorrentStateLive {
             .states
             .iter_mut()
             .filter_map(|mut p| p.value_mut().reconnect_not_needed_peer(&self.peers))
-            .map(|socket_addr| self.peer_queue_tx.send(socket_addr))
+            .map(|socket_addr| self.peer_queue_tx.send((socket_addr, None)))
             .take_while(|r| r.is_ok())
             .last();
     }
@@ -1390,7 +1408,7 @@ impl PeerHandler {
                     if should_requeue {
                         self.state
                             .peer_queue_tx
-                            .send(handle)
+                            .send((handle, None))
                             .ok()
                             .ok_or(Error::TorrentIsNotLive)?;
                     }
@@ -2037,6 +2055,11 @@ impl PeerHandler {
     // selects uTP since a NATed initiator is unreachable over SOCKS-TCP). We do not
     // yet act as a rendezvous (relay) or initiator.
     fn on_holepunch_message(&self, msg: UtHolepunch) {
+        // A hole-punch dial is a uTP simultaneous-open through the SOCKS/Mullvad
+        // relay; the two sides' SYNs must overlap in the NAT pinhole window. The
+        // default peer connect timeout (often ~8s) is too tight for that across a
+        // relay, so give punch dials a longer window.
+        const HOLEPUNCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
         match msg {
             UtHolepunch::Connect(target) => {
                 debug!(?target, "ut_holepunch: connect, dialing target to punch");
@@ -2045,7 +2068,10 @@ impl PeerHandler {
                     .counters
                     .holepunch_connects
                     .fetch_add(1, Ordering::Relaxed);
-                if let Err(error) = self.state.add_peer_if_not_seen(target) {
+                if let Err(error) = self.state.add_peer_if_not_seen_with_connect_timeout(
+                    target,
+                    Some(HOLEPUNCH_CONNECT_TIMEOUT),
+                ) {
                     debug!(
                         ?target,
                         "ut_holepunch: failed to queue connect-back: {error:#}"
