@@ -2039,7 +2039,12 @@ impl PeerHandler {
     fn on_holepunch_message(&self, msg: UtHolepunch) {
         match msg {
             UtHolepunch::Connect(target) => {
-                trace!(?target, "ut_holepunch: connect, dialing target to punch");
+                debug!(?target, "ut_holepunch: connect, dialing target to punch");
+                self.state
+                    .session_stats
+                    .counters
+                    .holepunch_connects
+                    .fetch_add(1, Ordering::Relaxed);
                 if let Err(error) = self.state.add_peer_if_not_seen(target) {
                     debug!(
                         ?target,
