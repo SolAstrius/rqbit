@@ -799,6 +799,7 @@ impl Session {
                     socks_proxy_config: proxy_config.clone(),
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     utp_socket_socks,
+                    utp_race_delay: opts.connect.as_ref().and_then(|c| c.utp_race_delay),
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
                     encryption: opts

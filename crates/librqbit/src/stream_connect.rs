@@ -56,6 +56,10 @@ pub struct ConnectionOptions {
     /// Experimental: relay outbound uTP through the SOCKS5 proxy (UDP ASSOCIATE).
     /// Only has an effect when `proxy_url` is set. Default off.
     pub experimental_utp_over_socks: bool,
+    /// Head start given to TCP (or SOCKS-TCP) before the uTP arm of an outbound
+    /// connection race is attempted. `None` uses the default (1s). Lower it to let
+    /// uTP compete more evenly; `0` races both simultaneously.
+    pub utp_race_delay: Option<Duration>,
 }
 
 impl Default for ConnectionOptions {
@@ -66,6 +70,7 @@ impl Default for ConnectionOptions {
             peer_opts: None,
             encryption: Encryption::default(),
             experimental_utp_over_socks: false,
+            utp_race_delay: None,
         }
     }
 }
@@ -85,6 +90,8 @@ pub(crate) struct StreamConnectorArgs {
     /// Experimental: outbound uTP relayed through the SOCKS5 proxy. Mutually
     /// exclusive with a direct `utp_socket` in practice (proxy disables listening).
     pub utp_socket_socks: Option<Arc<SocksUtpSocket>>,
+    /// Head start for TCP over uTP in the outbound connection race. `None` => 1s.
+    pub utp_race_delay: Option<Duration>,
     pub bind_device: Option<BindDevice>,
     pub ipv4_only: bool,
     pub encryption: Encryption,
@@ -250,6 +257,9 @@ pub(crate) struct SocksUdpSocket {
     reassociating: std::sync::atomic::AtomicBool,
 }
 
+// Default head start for TCP over uTP in an outbound connection race (overridable
+// via ConnectionOptions::utp_race_delay).
+const DEFAULT_UTP_RACE_DELAY: Duration = Duration::from_secs(1);
 // If no datagram arrives within this window while a send is outstanding, assume
 // the SOCKS5 UDP relay died and rebuild the association.
 const SOCKS_UDP_RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -614,6 +624,7 @@ pub(crate) struct StreamConnector {
     bind_device: Option<BindDevice>,
     utp_socket: Option<Arc<librqbit_utp::UtpSocketUdp>>,
     utp_socket_socks: Option<Arc<SocksUtpSocket>>,
+    utp_race_delay: Duration,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
     encryption: Encryption,
@@ -640,6 +651,7 @@ impl StreamConnector {
             enable_tcp: config.enable_tcp,
             utp_socket: config.utp_socket,
             utp_socket_socks: config.utp_socket_socks,
+            utp_race_delay: config.utp_race_delay.unwrap_or(DEFAULT_UTP_RACE_DELAY),
             bind_device: config.bind_device,
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
@@ -762,7 +774,7 @@ impl StreamConnector {
             let socks_utp = async {
                 tokio::select! {
                     _ = socks_failed_notify.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = tokio::time::sleep(self.utp_race_delay) => {}
                 }
                 let conn = self
                     .with_stat(ConnectionKind::Utp, addr.is_ipv6(), usock.connect(addr))
@@ -826,7 +838,7 @@ impl StreamConnector {
                 // wait until either 1 second has passed or TCP failed.
                 tokio::select! {
                     _ = tcp_failed_notify.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = tokio::time::sleep(self.utp_race_delay) => {}
                 }
             }
 

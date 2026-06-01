@@ -203,6 +203,12 @@ struct Opts {
     )]
     experimental_utp_over_socks: bool,
 
+    /// Head start in milliseconds given to TCP (or SOCKS-TCP) before uTP is tried
+    /// in an outbound connection race. Lower = uTP competes more evenly; 0 = race
+    /// both at once. Defaults to 1000ms when unset.
+    #[arg(long = "utp-race-delay-ms", env = "RQBIT_UTP_RACE_DELAY_MS")]
+    utp_race_delay_ms: Option<u64>,
+
     /// The port to listen for incoming connections (applies to both TCP and uTP).
     ///
     /// Defaults to 4240 for the server, and an ephemeral port for "rqbit download / rqbit share".
@@ -669,6 +675,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             enable_tcp: !opts.disable_tcp_connect,
             encryption: opts.encryption.into(),
             experimental_utp_over_socks: opts.experimental_utp_over_socks,
+            utp_race_delay: opts.utp_race_delay_ms.map(Duration::from_millis),
             peer_opts: Some(PeerConnectionOptions {
                 connect_timeout: Some(opts.peer_connect_timeout),
                 read_write_timeout: Some(opts.peer_read_write_timeout),
