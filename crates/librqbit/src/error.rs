@@ -120,6 +120,9 @@ pub enum Error {
 
     #[error(transparent)]
     Core(#[from] librqbit_core::Error),
+
+    #[error("MSE/PE handshake failed: {0:#}")]
+    Mse(#[from] crate::mse::MseError),
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

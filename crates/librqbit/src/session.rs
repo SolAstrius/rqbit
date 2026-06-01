@@ -734,6 +734,11 @@ impl Session {
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
+                    encryption: opts
+                        .connect
+                        .as_ref()
+                        .map(|c| c.encryption)
+                        .unwrap_or_default(),
                 })
                 .await
                 .context("error creating stream connector")?,
@@ -998,12 +1003,75 @@ impl Session {
             bail!("Incoming ip {incoming_ip} is not in allowlist");
         }
 
+        // MSE/PE: when obfuscation is enabled for incoming connections, peek the
+        // first byte to distinguish a legacy plaintext BT handshake (pstrlen
+        // 0x13 == "19") from an MSE Diffie-Hellman exchange (high-entropy first
+        // byte), and run the obfuscation handshake before the BT handshake. The
+        // wrapped streams transparently (de)obfuscate everything after.
+        let mut writer = writer;
+        let mut mse_info_hash = None;
+        let encryption = self.connector.encryption();
+        if encryption.enabled() {
+            use tokio::io::AsyncReadExt;
+            let mut first = [0u8; 1];
+            let n = tokio::time::timeout(rwtimeout, reader.read(&mut first))
+                .await
+                .context("timeout peeking incoming connection")?
+                .context("error peeking incoming connection")?;
+            if n == 0 {
+                bail!("peer disconnected before sending anything");
+            }
+            if first[0] == 0x13 {
+                if matches!(encryption, crate::Encryption::Required) {
+                    bail!("rejecting plaintext incoming peer: encryption required");
+                }
+                // Legacy plaintext peer: push the peeked byte back in front.
+                reader = crate::mse::prepend(reader, vec![first[0]]);
+            } else {
+                let known: Vec<Id20> = self
+                    .db
+                    .read()
+                    .torrents
+                    .values()
+                    .map(|t| t.info_hash())
+                    .collect();
+                let mse = tokio::time::timeout(
+                    rwtimeout,
+                    crate::mse::handshake_incoming(
+                        reader,
+                        writer,
+                        first[0],
+                        &known,
+                        encryption.allow_plaintext(),
+                    ),
+                )
+                .await
+                .context("timeout during MSE handshake")?
+                .context("error during MSE handshake")?;
+                debug!(%addr, method = %mse.method, "accepted obfuscated (MSE) incoming connection");
+                mse_info_hash = Some(mse.info_hash);
+                reader = mse.reader;
+                writer = mse.writer;
+            }
+        }
+
         let mut read_buf = ReadBuf::new();
         let h = read_buf
             .read_handshake(&mut reader, rwtimeout)
             .await
             .context("error reading handshake")?;
         trace!("received handshake from {addr}: {:?}", h);
+
+        // Defend against a peer that completed the MSE handshake against one
+        // torrent's SKEY but sends a BT handshake for a different info-hash.
+        if let Some(mse_ih) = mse_info_hash
+            && mse_ih != h.info_hash
+        {
+            bail!(
+                "MSE SKEY info-hash {mse_ih:?} does not match BT handshake {:?}",
+                h.info_hash
+            );
+        }
 
         if h.peer_id == self.peer_id {
             bail!("seems like we are connecting to ourselves, ignoring");

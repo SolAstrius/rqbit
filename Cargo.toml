@@ -117,6 +117,7 @@ mime_guess = { version = "2", default-features = false }
 network-interface = "2"
 nix = "0.30"
 notify = "8"
+num-bigint = "0.4"
 openssl = "0.10"
 parking_lot = "0.12"
 parse_duration = "2"

@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     Error, PeerConnectionOptions, Result,
+    mse::Encryption,
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite},
     vectored_traits::AsyncReadVectoredIntoCompat,
 };
@@ -46,6 +47,9 @@ pub struct ConnectionOptions {
     // TCP outgoing connections are enabled by default
     pub enable_tcp: bool,
     pub peer_opts: Option<PeerConnectionOptions>,
+    /// MSE/PE protocol obfuscation policy for incoming and outgoing peer
+    /// connections. Default `Disabled` (plaintext only).
+    pub encryption: Encryption,
 }
 
 impl Default for ConnectionOptions {
@@ -54,6 +58,7 @@ impl Default for ConnectionOptions {
             enable_tcp: true,
             proxy_url: None,
             peer_opts: None,
+            encryption: Encryption::default(),
         }
     }
 }
@@ -72,6 +77,7 @@ pub(crate) struct StreamConnectorArgs {
     pub utp_socket: Option<Arc<UtpSocketUdp>>,
     pub bind_device: Option<BindDevice>,
     pub ipv4_only: bool,
+    pub encryption: Encryption,
 }
 
 impl SocksProxyConfig {
@@ -395,6 +401,7 @@ pub(crate) struct StreamConnector {
     utp_socket: Option<Arc<librqbit_utp::UtpSocketUdp>>,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
+    encryption: Encryption,
 }
 
 impl StreamConnector {
@@ -420,7 +427,13 @@ impl StreamConnector {
             bind_device: config.bind_device,
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
+            encryption: config.encryption,
         })
+    }
+
+    /// The configured MSE/PE obfuscation policy.
+    pub fn encryption(&self) -> Encryption {
+        self.encryption
     }
 
     fn get_stat(&self, kind: ConnectionKind, is_v6: bool) -> &SingleStatAtomic {

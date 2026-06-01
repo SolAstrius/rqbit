@@ -227,6 +227,28 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         async move {
             self.handler.on_connected(now.elapsed());
 
+            // MSE/PE: when obfuscation is enabled, perform the encryption
+            // handshake before any BitTorrent bytes. Everything below then runs
+            // transparently over the wrapped (RC4 or passthrough) streams.
+            let encryption = self.connector.encryption();
+            if encryption.enabled() {
+                let mse = with_timeout(
+                    "mse handshake",
+                    rwtimeout,
+                    crate::mse::handshake_outgoing(
+                        read,
+                        write,
+                        &self.info_hash,
+                        encryption.allow_plaintext(),
+                    )
+                    .map_err(Error::from),
+                )
+                .await?;
+                trace!(method = %mse.method, "established outgoing MSE connection");
+                read = mse.reader;
+                write = mse.writer;
+            }
+
             let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
             let handshake = Handshake::new(self.info_hash, self.peer_id);
             let hsz = handshake.serialize_unchecked_len(&mut *write_buf);

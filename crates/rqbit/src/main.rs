@@ -39,6 +39,29 @@ enum LogLevel {
     Error,
 }
 
+/// MSE/PE protocol-obfuscation policy. This is obfuscation (anti traffic-shaping),
+/// not security: there is no peer authentication and RC4 is weak.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum EncryptionMode {
+    /// Plaintext BitTorrent only (default).
+    #[default]
+    Disabled,
+    /// Outgoing: attempt MSE, offering plaintext fallback. Incoming: accept both.
+    Enabled,
+    /// MSE with RC4 only; reject plaintext peers in both directions.
+    Required,
+}
+
+impl From<EncryptionMode> for librqbit::Encryption {
+    fn from(m: EncryptionMode) -> Self {
+        match m {
+            EncryptionMode::Disabled => librqbit::Encryption::Disabled,
+            EncryptionMode::Enabled => librqbit::Encryption::Enabled,
+            EncryptionMode::Required => librqbit::Encryption::Required,
+        }
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 fn parse_umask(value: &str) -> anyhow::Result<libc::mode_t> {
     fn parse_oct_digit(d: u8) -> Option<libc::mode_t> {
@@ -152,6 +175,18 @@ struct Opts {
     /// (--disable-tcp-listen to disable).
     #[arg(long = "disable-tcp-connect", env = "RQBIT_TCP_CONNECT_DISABLE")]
     disable_tcp_connect: bool,
+
+    /// MSE/PE protocol obfuscation, to defeat ISP traffic shaping / DPI.
+    /// "disabled" (default), "enabled" (try obfuscation, allow plaintext
+    /// fallback), or "required" (RC4 only, reject plaintext peers).
+    /// NOTE: obfuscation, not security — no authentication, weak cipher.
+    #[arg(
+        long = "encryption",
+        value_enum,
+        default_value_t,
+        env = "RQBIT_ENCRYPTION"
+    )]
+    encryption: EncryptionMode,
 
     /// Enable to listen and connect over uTP
     #[arg(
@@ -624,6 +659,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         connect: Some(ConnectionOptions {
             proxy_url: opts.socks_url.take(),
             enable_tcp: !opts.disable_tcp_connect,
+            encryption: opts.encryption.into(),
             peer_opts: Some(PeerConnectionOptions {
                 connect_timeout: Some(opts.peer_connect_timeout),
                 read_write_timeout: Some(opts.peer_read_write_timeout),

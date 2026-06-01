@@ -10,7 +10,7 @@ use tokio::{
 use tracing::{Instrument, error, error_span, info};
 
 use crate::{
-    AddTorrentOptions, AddTorrentResponse, ConnectionOptions, ListenerMode, Session,
+    AddTorrentOptions, AddTorrentResponse, ConnectionOptions, Encryption, ListenerMode, Session,
     SessionOptions, SessionPersistenceConfig, create_torrent,
     listen::ListenerOptions,
     spawn_utils::BlockingSpawner,
@@ -22,15 +22,22 @@ use crate::{
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_download_tcp() {
-    _test_e2e_download_timeout_and_cleanups(ListenerMode::TcpOnly).await
+    _test_e2e_download_timeout_and_cleanups(ListenerMode::TcpOnly, Encryption::Disabled).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_download_utp() {
-    _test_e2e_download_timeout_and_cleanups(ListenerMode::UtpOnly).await
+    _test_e2e_download_timeout_and_cleanups(ListenerMode::UtpOnly, Encryption::Disabled).await
 }
 
-async fn _test_e2e_download_timeout_and_cleanups(mode: ListenerMode) {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_download_tcp_encrypted() {
+    // Both sides require MSE/PE (RC4 only), proving the obfuscated handshake and
+    // encrypted stream wrappers work end to end over a real transport.
+    _test_e2e_download_timeout_and_cleanups(ListenerMode::TcpOnly, Encryption::Required).await
+}
+
+async fn _test_e2e_download_timeout_and_cleanups(mode: ListenerMode, encryption: Encryption) {
     let timeout = std::env::var("E2E_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -39,7 +46,7 @@ async fn _test_e2e_download_timeout_and_cleanups(mode: ListenerMode) {
     let drop_checks = DropChecks::default();
     tokio::time::timeout(
         Duration::from_secs(timeout),
-        _test_e2e_download(mode, &drop_checks),
+        _test_e2e_download(mode, encryption, &drop_checks),
     )
     .await
     .context("test_e2e_download timed out")
@@ -51,7 +58,7 @@ async fn _test_e2e_download_timeout_and_cleanups(mode: ListenerMode) {
     drop_checks.check().unwrap();
 }
 
-async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
+async fn _test_e2e_download(mode: ListenerMode, encryption: Encryption, drop_checks: &DropChecks) {
     setup_test_logging();
     match crate::try_increase_nofile_limit() {
         Ok(limit) => info!(limit, "increased ulimit"),
@@ -110,6 +117,10 @@ async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
                         listen: Some(ListenerOptions {
                             mode,
                             listen_addr: (Ipv4Addr::LOCALHOST, listen_port).into(),
+                            ..Default::default()
+                        }),
+                        connect: Some(ConnectionOptions {
+                            encryption,
                             ..Default::default()
                         }),
                         root_span: Some(error_span!(parent: None, "server", id = i)),
@@ -226,6 +237,7 @@ async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
                 },
                 connect: Some(ConnectionOptions {
                     enable_tcp: mode.tcp_enabled(),
+                    encryption,
                     ..Default::default()
                 }),
                 fastresume: true,

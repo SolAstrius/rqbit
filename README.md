@@ -163,6 +163,7 @@ Use a regex here to select files by their names.
 - [BEP-32: IPv6 extension for DHT](https://www.bittorrent.org/beps/bep_0032.html)
 - [BEP-47: Padding files and extended file attributes](https://www.bittorrent.org/beps/bep_0047.html)
 - [BEP-53: Magnet URI extension - Select specific file indices for download](https://www.bittorrent.org/beps/bep_0053.html)
+- [MSE/PE: Message Stream Encryption / Protocol Encryption](https://wiki.vuze.com/w/Message_Stream_Encryption) (protocol obfuscation; opt-in via `--encryption`)
 
 ### Some supported features
 
