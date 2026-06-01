@@ -1,15 +1,18 @@
 use std::{
+    io::IoSlice,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, RwLock as StdRwLock},
+    task::Poll,
     time::Duration,
 };
 
 use anyhow::{Context, bail};
 use fast_socks5::client::Socks5Datagram;
+use fast_socks5::new_udp_header;
 use fast_socks5::util::target_addr::TargetAddr;
 use futures::future::BoxFuture;
-use librqbit_dualstack_sockets::ConnectOpts;
-use librqbit_utp::{BindDevice, UtpSocketUdp};
+use librqbit_dualstack_sockets::{ConnectOpts, PollSendToVectored};
+use librqbit_utp::{BindDevice, DefaultUtpEnvironment, Transport, UtpSocket, UtpSocketUdp};
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
@@ -50,6 +53,9 @@ pub struct ConnectionOptions {
     /// MSE/PE protocol obfuscation policy for incoming and outgoing peer
     /// connections. Default `Disabled` (plaintext only).
     pub encryption: Encryption,
+    /// Experimental: relay outbound uTP through the SOCKS5 proxy (UDP ASSOCIATE).
+    /// Only has an effect when `proxy_url` is set. Default off.
+    pub experimental_utp_over_socks: bool,
 }
 
 impl Default for ConnectionOptions {
@@ -59,6 +65,7 @@ impl Default for ConnectionOptions {
             proxy_url: None,
             peer_opts: None,
             encryption: Encryption::default(),
+            experimental_utp_over_socks: false,
         }
     }
 }
@@ -75,6 +82,9 @@ pub(crate) struct StreamConnectorArgs {
     pub enable_tcp: bool,
     pub socks_proxy_config: Option<SocksProxyConfig>,
     pub utp_socket: Option<Arc<UtpSocketUdp>>,
+    /// Experimental: outbound uTP relayed through the SOCKS5 proxy. Mutually
+    /// exclusive with a direct `utp_socket` in practice (proxy disables listening).
+    pub utp_socket_socks: Option<Arc<SocksUtpSocket>>,
     pub bind_device: Option<BindDevice>,
     pub ipv4_only: bool,
     pub encryption: Encryption,
@@ -378,6 +388,210 @@ impl tracker_comms::UdpTransport for SocksUdpSocket {
     }
 }
 
+/// Outbound µTP transport whose datagrams are relayed through a SOCKS5 proxy via
+/// UDP ASSOCIATE. Implements [`librqbit_utp::Transport`] so a `UtpSocket` can be
+/// built over the proxy — the missing bridge that lets uTP work behind the SOCKS5
+/// relay we already use for DHT and UDP trackers.
+///
+/// uTP's `Transport` needs a *synchronous* `poll_send_to`, which the async-only
+/// [`SocksUdpSocket`] can't provide. The enabler: the datagram's inner UDP socket
+/// is `connect()`ed to the relay (see `Socks5Datagram::bind_internal`), so
+/// `get_ref()` hands back a connected `tokio::net::UdpSocket` with a real
+/// `poll_send`. We frame manually with `new_udp_header` and keep the datagram
+/// behind a std `RwLock<Arc<..>>` so the sync path reads it without `.await`.
+pub(crate) struct SocksUtpTransport {
+    proxy: SocksProxyConfig,
+    bind_device: Option<BindDevice>,
+    // Swappable so the sync poll path reads it without `.await`, while the async
+    // recv supervisor can rebuild it on relay death. std (not tokio) RwLock on
+    // purpose: NEVER hold the guard across `.await` — clone the Arc and drop it.
+    inner: StdRwLock<Arc<Socks5Datagram<tokio::net::TcpStream>>>,
+    bind_addr: SocketAddr,
+    // Set on send, cleared on receive. If a recv idles out while set, we sent into
+    // the void and the relay is presumed dead.
+    sent_since_recv: std::sync::atomic::AtomicBool,
+    // Ensures only one reassociation runs at a time across send/recv paths.
+    reassociating: std::sync::atomic::AtomicBool,
+}
+
+impl SocksUtpTransport {
+    pub(crate) async fn new(
+        proxy: SocksProxyConfig,
+        bind_device: Option<BindDevice>,
+    ) -> Result<Self> {
+        let (dgram, bind_addr) = proxy.bind_udp_datagram(bind_device.as_ref()).await?;
+        Ok(Self {
+            proxy,
+            bind_device,
+            inner: StdRwLock::new(Arc::new(dgram)),
+            bind_addr,
+            sent_since_recv: std::sync::atomic::AtomicBool::new(false),
+            reassociating: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn current(&self) -> Arc<Socks5Datagram<tokio::net::TcpStream>> {
+        self.inner.read().unwrap().clone()
+    }
+
+    // Rebuild the SOCKS5 UDP association in place. De-duplicated so concurrent
+    // triggers from the send and recv paths don't stack up rebuilds. NOTE: a new
+    // association means a new relay source port, which breaks any in-flight uTP
+    // connection — acceptable for the DHT-style "don't go permanently deaf" goal,
+    // but see the idle-reassoc note in `recv_from`.
+    async fn reassociate(&self, reason: &str) {
+        use std::sync::atomic::Ordering;
+        if self
+            .reassociating
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        match self
+            .proxy
+            .bind_udp_datagram(self.bind_device.as_ref())
+            .await
+        {
+            Ok((dgram, _)) => {
+                *self.inner.write().unwrap() = Arc::new(dgram);
+                self.sent_since_recv.store(false, Ordering::Relaxed);
+                info!(reason, "re-established SOCKS5 UDP association for uTP");
+            }
+            Err(e) => {
+                warn!(
+                    reason,
+                    "failed to re-establish SOCKS5 UDP association for uTP: {e:#}"
+                );
+                tokio::time::sleep(SOCKS_REASSOCIATE_BACKOFF).await;
+            }
+        }
+        self.reassociating.store(false, Ordering::Release);
+    }
+
+    // Frame `parts` (concatenated) for `target` and synchronously poll_send the
+    // SOCKS5-UDP-framed datagram to the connected relay socket. On success returns
+    // the *payload* length (a datagram send is atomic — all or nothing).
+    fn poll_send_framed(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        target: SocketAddr,
+        parts: &[&[u8]],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut frame = match new_udp_header(target) {
+            Ok(h) => h,
+            Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
+        };
+        let mut payload_len = 0usize;
+        for p in parts {
+            frame.extend_from_slice(p);
+            payload_len += p.len();
+        }
+        let dgram = self.current();
+        match dgram.get_ref().poll_send(cx, &frame) {
+            Poll::Ready(Ok(_n)) => {
+                self.sent_since_recv
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                Poll::Ready(Ok(payload_len))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl PollSendToVectored for SocksUtpTransport {
+    fn poll_send_to_vectored(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        // Coalesce into one framed datagram (the SOCKS header is prepended inside
+        // poll_send_framed). Correct but copies; optimize to a writev to the relay
+        // addr later only if profiles show it hot.
+        let parts: Vec<&[u8]> = bufs.iter().map(|s| &s[..]).collect();
+        self.poll_send_framed(cx, target, &parts)
+    }
+}
+
+impl Transport for SocksUtpTransport {
+    // The trait's explicit `+ Send + Sync` return bounds preclude a clean `async fn`,
+    // so keep the impl-Future form (matching the crate's own UdpSocket impl).
+    #[allow(clippy::manual_async_fn)]
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> impl std::future::Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + Sync + 'a
+    {
+        async move {
+            use std::sync::atomic::Ordering;
+            loop {
+                let dgram = self.current();
+                let timed =
+                    tokio::time::timeout(SOCKS_UDP_RECV_IDLE_TIMEOUT, dgram.recv_from(buf)).await;
+                match timed {
+                    Ok(Ok((n, ta))) => {
+                        self.sent_since_recv.store(false, Ordering::Relaxed);
+                        return Ok((n, target_addr_to_socket_addr(ta)?));
+                    }
+                    Ok(Err(e)) => {
+                        debug!("error receiving from SOCKS5 UDP relay (uTP): {e:#}");
+                        self.reassociate("recv error").await;
+                    }
+                    Err(_elapsed) => {
+                        // Idle. Only reassociate if we sent into the void (relay
+                        // presumed dead). During active uTP transfers recv is
+                        // constant, so this won't fire mid-connection. TODO: consider
+                        // error-only reassoc to never risk a live connection.
+                        if self.sent_since_recv.swap(false, Ordering::Relaxed) {
+                            self.reassociate("recv idle after send").await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send + Sync + 'a {
+        async move {
+            let dgram = self.current();
+            match dgram.send_to(buf, target).await {
+                Ok(n) => {
+                    self.sent_since_recv
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(n)
+                }
+                Err(e) => {
+                    self.reassociate("send error").await;
+                    Err(socks_err_to_io(e))
+                }
+            }
+        }
+    }
+
+    fn poll_send_to(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        self.poll_send_framed(cx, target, &[buf])
+    }
+
+    fn bind_addr(&self) -> SocketAddr {
+        self.bind_addr
+    }
+}
+
+/// A uTP socket whose datagrams are relayed through a SOCKS5 proxy.
+pub(crate) type SocksUtpSocket = UtpSocket<SocksUtpTransport, DefaultUtpEnvironment>;
+
 gen_stats!(SingleStatAtomic SingleStatSnapshot, [
     attempts u64,
     successes u64,
@@ -399,6 +613,7 @@ pub(crate) struct StreamConnector {
     enable_tcp: bool,
     bind_device: Option<BindDevice>,
     utp_socket: Option<Arc<librqbit_utp::UtpSocketUdp>>,
+    utp_socket_socks: Option<Arc<SocksUtpSocket>>,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
     encryption: Encryption,
@@ -424,6 +639,7 @@ impl StreamConnector {
             proxy_config: config.socks_proxy_config,
             enable_tcp: config.enable_tcp,
             utp_socket: config.utp_socket,
+            utp_socket_socks: config.utp_socket_socks,
             bind_device: config.bind_device,
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
@@ -501,19 +717,72 @@ impl StreamConnector {
         }
 
         if let Some(proxy) = self.proxy_config.as_ref() {
-            let (r, w) = self
-                .with_stat(
+            // Primary: SOCKS5 TCP CONNECT (mature, simple).
+            let socks_tcp = async {
+                let (r, w) = self
+                    .with_stat(
+                        ConnectionKind::Socks,
+                        addr.is_ipv6(),
+                        proxy.connect(addr, self.bind_device.as_ref()),
+                    )
+                    .await?;
+                debug!(?addr, "connected through SOCKS5");
+                Ok::<_, Error>((
                     ConnectionKind::Socks,
-                    addr.is_ipv6(),
-                    proxy.connect(addr, self.bind_device.as_ref()),
-                )
-                .await?;
-            debug!(?addr, "connected through SOCKS5");
-            return Ok((
-                ConnectionKind::Socks,
-                Box::new(r.into_vectored_compat()),
-                Box::new(w),
-            ));
+                    Box::new(r.into_vectored_compat()) as BoxAsyncReadVectored,
+                    Box::new(w) as BoxAsyncWrite,
+                ))
+            };
+
+            // Without uTP-over-SOCKS configured, behaviour is unchanged: SOCKS TCP only.
+            let Some(usock) = self.utp_socket_socks.clone() else {
+                return socks_tcp.await;
+            };
+
+            // Secondary: uTP relayed through the same SOCKS5 proxy. Give SOCKS TCP a
+            // 1s head start (mirrors the direct TCP-vs-uTP race below), then race.
+            let socks_failed_notify = tokio::sync::Notify::new();
+            let socks_utp = async {
+                tokio::select! {
+                    _ = socks_failed_notify.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                let conn = self
+                    .with_stat(ConnectionKind::Utp, addr.is_ipv6(), usock.connect(addr))
+                    .await
+                    .map_err(Error::UtpConnect)?;
+                debug!(?addr, "connected over uTP-over-SOCKS");
+                let (r, w) = conn.split();
+                Ok::<_, Error>((
+                    ConnectionKind::Utp,
+                    Box::new(r) as BoxAsyncReadVectored,
+                    Box::new(w) as BoxAsyncWrite,
+                ))
+            };
+
+            tokio::pin!(socks_tcp);
+            tokio::pin!(socks_utp);
+            let mut tcp_err: Option<Error> = None;
+            let mut utp_err: Option<Error> = None;
+            loop {
+                if tcp_err.is_some() && utp_err.is_some() {
+                    // Both failed; surface the SOCKS TCP error (the primary path).
+                    return Err(tcp_err.take().unwrap());
+                }
+                tokio::select! {
+                    res = &mut socks_tcp, if tcp_err.is_none() => match res {
+                        Ok(triple) => return Ok(triple),
+                        Err(e) => {
+                            tcp_err = Some(e);
+                            socks_failed_notify.notify_waiters();
+                        }
+                    },
+                    res = &mut socks_utp, if utp_err.is_none() => match res {
+                        Ok(triple) => return Ok(triple),
+                        Err(e) => utp_err = Some(e),
+                    },
+                }
+            }
         }
 
         // Try to connect over TCP first. If in 1 second we haven't connected, try uTP also (if configured).

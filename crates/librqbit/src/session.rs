@@ -741,11 +741,64 @@ impl Session {
                     .context("error building HTTP(S) client")?
             };
 
+            // Experimental: outbound uTP relayed through the SOCKS5 proxy. Off by
+            // default (see ConnectionOptions::experimental_utp_over_socks). Builds a
+            // dedicated, self-healing UDP ASSOCIATE just for uTP, mirroring the DHT
+            // socket injection above.
+            let utp_socket_socks = {
+                let enabled = opts
+                    .connect
+                    .as_ref()
+                    .map(|c| c.experimental_utp_over_socks)
+                    .unwrap_or(false);
+                match (enabled, proxy_config.as_ref()) {
+                    (true, Some(proxy)) => {
+                        match crate::stream_connect::SocksUtpTransport::new(
+                            proxy.clone(),
+                            bind_device.clone(),
+                        )
+                        .await
+                        {
+                            Ok(transport) => {
+                                let utp_opts = librqbit_utp::SocketOpts {
+                                    cancellation_token: token.child_token(),
+                                    dont_wait_for_lastack: true,
+                                    parent_span: opts.root_span.as_ref().and_then(|s| s.id()),
+                                    ..Default::default()
+                                };
+                                match librqbit_utp::UtpSocket::new_with_opts(
+                                    transport,
+                                    librqbit_utp::DefaultUtpEnvironment::default(),
+                                    utp_opts,
+                                ) {
+                                    Ok(s) => {
+                                        info!(
+                                            "enabled experimental uTP-over-SOCKS for outbound peers"
+                                        );
+                                        Some(s)
+                                    }
+                                    Err(e) => {
+                                        warn!("couldn't create uTP-over-SOCKS socket: {e:#}");
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("couldn't establish uTP-over-SOCKS association: {e:#}");
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            };
+
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
                     socks_proxy_config: proxy_config.clone(),
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
+                    utp_socket_socks,
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
                     encryption: opts

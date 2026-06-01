@@ -155,3 +155,9 @@ urlencoding = "2"
 uuid = "1"
 walkdir = "2"
 windows = "0.62"
+
+# Fork that re-exports DefaultUtpEnvironment + UtpEnvironment so we can build a
+# UtpSocket over a custom Transport (uTP-over-SOCKS). Upstream 0.7.0 only exports
+# `Transport`, which makes the env type unnameable from outside the crate.
+[patch.crates-io]
+librqbit-utp = { git = "https://github.com/SolAstrius/librqbit-utp", branch = "utp-custom-transport-exports" }

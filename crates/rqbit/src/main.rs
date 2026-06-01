@@ -195,6 +195,14 @@ struct Opts {
     )]
     enable_utp_listen: bool,
 
+    /// Relay outbound uTP through the SOCKS5 proxy (UDP ASSOCIATE). Only has an
+    /// effect together with --socks-url. Experimental.
+    #[arg(
+        long = "experimental-utp-over-socks",
+        env = "RQBIT_EXPERIMENTAL_UTP_OVER_SOCKS"
+    )]
+    experimental_utp_over_socks: bool,
+
     /// The port to listen for incoming connections (applies to both TCP and uTP).
     ///
     /// Defaults to 4240 for the server, and an ephemeral port for "rqbit download / rqbit share".
@@ -660,6 +668,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             proxy_url: opts.socks_url.take(),
             enable_tcp: !opts.disable_tcp_connect,
             encryption: opts.encryption.into(),
+            experimental_utp_over_socks: opts.experimental_utp_over_socks,
             peer_opts: Some(PeerConnectionOptions {
                 connect_timeout: Some(opts.peer_connect_timeout),
                 read_write_timeout: Some(opts.peer_read_write_timeout),
