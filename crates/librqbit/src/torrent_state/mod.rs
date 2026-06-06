@@ -121,6 +121,9 @@ pub(crate) struct ManagedTorrentOptions {
     pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
+    // Max number of peer-state entries retained per torrent (live + idle). Bounds memory;
+    // idle (dead/not-needed) entries are reaped down to this when exceeded.
+    pub max_peer_states: Option<usize>,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
 }

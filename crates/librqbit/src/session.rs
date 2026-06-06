@@ -170,6 +170,7 @@ pub struct Session {
     _disable_upload: bool,
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
+    pub max_peer_states: Option<usize>,
     client_name_and_version: String,
 }
 
@@ -302,6 +303,10 @@ pub struct AddTorrentOptions {
 
     /// Max concurrent connected peers.
     pub peer_limit: Option<usize>,
+
+    /// Max retained peer-state entries per torrent (live + idle). Bounds memory growth from
+    /// peer discovery; idle (dead/not-needed) entries are reaped down to this. Defaults to 2000.
+    pub max_peer_states: Option<usize>,
 
     /// This is used to restore the session from serialized state.
     pub preferred_id: Option<usize>,
@@ -485,6 +490,9 @@ pub struct SessionOptions {
 
     /// Default peer limit per torrent.
     pub peer_limit: Option<usize>,
+
+    /// Default max retained peer-state entries per torrent.
+    pub max_peer_states: Option<usize>,
 
     #[cfg(feature = "disable-upload")]
     pub disable_upload: bool,
@@ -914,6 +922,7 @@ impl Session {
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
                 peer_limit: opts.peer_limit,
+                max_peer_states: opts.max_peer_states,
                 client_name_and_version,
 
                 #[cfg(feature = "disable-upload")]
@@ -1571,6 +1580,7 @@ impl Session {
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
+                    max_peer_states: opts.max_peer_states.or(self.max_peer_states),
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },

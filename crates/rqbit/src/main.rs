@@ -161,6 +161,11 @@ struct Opts {
     #[arg(long = "peer-limit", env = "RQBIT_PEER_LIMIT")]
     peer_limit: Option<usize>,
 
+    /// The maximum number of retained peer-state entries per torrent (live + idle). Bounds
+    /// memory growth from peer discovery; idle peers are reaped down to this. Defaults to 2000.
+    #[arg(long = "max-peer-states", env = "RQBIT_MAX_PEER_STATES")]
+    max_peer_states: Option<usize>,
+
     /// How many threads to spawn for the executor.
     #[arg(short = 't', long, env = "RQBIT_RUNTIME_WORKER_THREADS")]
     worker_threads: Option<usize>,
@@ -732,6 +737,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         disable_trackers: opts.disable_trackers,
         trackers,
         peer_limit: opts.peer_limit,
+        max_peer_states: opts.max_peer_states,
         runtime_worker_threads: Some(opts.max_blocking_threads as usize),
         ipv4_only: opts.ipv4_only,
         client_name_and_version: None,

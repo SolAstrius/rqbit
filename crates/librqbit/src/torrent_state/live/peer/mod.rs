@@ -3,6 +3,7 @@ pub mod stats;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use librqbit_core::hash_id::Id20;
 use librqbit_core::lengths::ChunkInfo;
@@ -26,6 +27,9 @@ pub(crate) struct Peer {
     state: PeerState,
     pub stats: stats::atomic::PeerStats,
     pub outgoing_address: Option<SocketAddr>,
+    // When this peer last entered an idle state (Dead/NotNeeded), used by the reaper to
+    // evict the longest-idle peers first. None while the peer is active or queued.
+    pub idle_since: Option<Instant>,
 }
 
 impl Peer {
@@ -45,6 +49,7 @@ impl Peer {
             state,
             stats: Default::default(),
             outgoing_address: None,
+            idle_since: None,
         }
     }
 
@@ -54,6 +59,7 @@ impl Peer {
             outgoing_address: Some(addr),
             stats: Default::default(),
             state: Default::default(),
+            idle_since: None,
         }
     }
 
@@ -151,6 +157,13 @@ impl Peer {
         for counter in [&counters.session_stats, &counters.stats] {
             counter.incdec(&self.state, &new);
         }
+        // Track when the peer became idle so the reaper can evict longest-idle first.
+        self.idle_since = match &new {
+            PeerState::Dead | PeerState::NotNeeded => {
+                self.idle_since.or_else(|| Some(Instant::now()))
+            }
+            PeerState::Queued | PeerState::Connecting(_) | PeerState::Live(_) => None,
+        };
         if let Some(addr) = self.outgoing_address {
             if matches!(&self.state, PeerState::Live(..)) {
                 counters.live_outgoing_peers.write().remove(&addr);

@@ -272,6 +272,12 @@ impl TorrentStateLive {
                 stats: Default::default(),
                 states: Default::default(),
                 live_outgoing_peers: Default::default(),
+                max_states: paused
+                    .shared
+                    .options
+                    .max_peer_states
+                    .unwrap_or(peers::DEFAULT_MAX_PEER_STATES)
+                    .max(1),
             },
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
@@ -345,6 +351,33 @@ impl TorrentStateLive {
             debug_span!(parent: state.shared.span.clone(), "upload_scheduler"),
             format!("[{}]upload_scheduler", state.shared.id),
             state.clone().task_upload_scheduler(ratelimit_upload_rx),
+        );
+
+        // Periodically reap the longest-idle (dead/not-needed) peers so retained peer-state
+        // can't grow unbounded. Reaps down to a low-water mark below the hard cap so there is
+        // headroom for freshly discovered peers between runs.
+        state.spawn(
+            debug_span!(parent: state.shared.span.clone(), "peer_state_reaper"),
+            format!("[{}]peer_state_reaper", state.shared.id),
+            {
+                let state = Arc::downgrade(&state);
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        let state = match state.upgrade() {
+                            Some(state) => state,
+                            None => return Ok(()),
+                        };
+                        let max = state.peers.max_states;
+                        // Keep ~10% headroom under the hard cap.
+                        let low_water = max - max / 10;
+                        let evicted = state.peers.reap_idle_peers(low_water);
+                        if evicted > 0 {
+                            debug!(evicted, retained = state.peers.states.len(), "reaped idle peers");
+                        }
+                    }
+                }
+            },
         );
         Ok(state)
     }
@@ -1369,11 +1402,13 @@ impl PeerHandler {
         pe.value_mut().set_state(PeerState::Dead, peers);
 
         if self.incoming {
-            // do not retry incoming peers
-            debug!(
-                peer = handle.to_string(),
-                "incoming peer died, not re-queueing"
-            );
+            // Incoming peers have no outgoing address to reconnect to, so a dead incoming
+            // peer is useless to retain (it can never be re-queued and serves no PEX role).
+            // Drop it instead of parking it as Dead forever, which otherwise leaks memory.
+            debug!(peer = handle.to_string(), "incoming peer died, dropping");
+            // Prevent deadlocks (drop_peer removes from the same DashMap shard).
+            drop(pe);
+            self.state.peers.drop_peer(handle);
             return Ok(());
         }
 

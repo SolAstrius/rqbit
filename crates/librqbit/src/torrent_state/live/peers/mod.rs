@@ -18,6 +18,10 @@ use super::peer::{LivePeerState, Peer, PeerRx, PeerState, PeerTx};
 
 pub mod stats;
 
+// Default cap on retained peer-state entries per torrent (live + idle). Bounds memory
+// growth from peer discovery (DHT/trackers/PEX) when most discovered peers never connect.
+pub(crate) const DEFAULT_MAX_PEER_STATES: usize = 2000;
+
 pub(crate) struct PeerStates {
     pub session_stats: Arc<AggregatePeerStatsAtomic>,
 
@@ -25,6 +29,9 @@ pub(crate) struct PeerStates {
     pub live_outgoing_peers: RwLock<HashSet<PeerHandle>>,
     pub stats: AggregatePeerStatsAtomic,
     pub states: DashMap<PeerHandle, Peer>,
+    // Hard cap on the number of retained entries in `states`. New peers are not admitted
+    // beyond this, and the reaper evicts idle entries down to it.
+    pub max_states: usize,
 }
 
 impl Drop for PeerStates {
@@ -42,6 +49,18 @@ impl PeerStates {
 
     pub fn add_if_not_seen(&self, addr: SocketAddr) -> Option<PeerHandle> {
         use dashmap::mapref::entry::Entry;
+        // Hard ceiling: refuse to grow the map past the cap. The reaper keeps idle entries
+        // below this, so there is normally headroom; this only bites during bursts of
+        // discovery when every retained peer is still active/queued.
+        //
+        // NOTE: this must be checked *before* taking the entry guard below. `states.entry()`
+        // write-locks the addr's shard, and `states.len()` read-locks every shard to count —
+        // calling len() while holding the guard would deadlock on that same shard. Checking
+        // first is also harmless when the addr already exists: entry() returns Occupied → None,
+        // the same result this early-return produces.
+        if self.states.len() >= self.max_states {
+            return None;
+        }
         match self.states.entry(addr) {
             Entry::Occupied(_) => None,
             Entry::Vacant(vac) => {
@@ -54,6 +73,48 @@ impl PeerStates {
                 Some(addr)
             }
         }
+    }
+
+    /// Evict the longest-idle (Dead/NotNeeded) peers until the map is at or below
+    /// `target_len`. Never touches Queued/Connecting/Live peers. Returns the number
+    /// of peers evicted. Cheap when already under target (no allocation).
+    pub fn reap_idle_peers(&self, target_len: usize) -> usize {
+        let len = self.states.len();
+        if len <= target_len {
+            return 0;
+        }
+        let want = len - target_len;
+
+        // Collect idle candidates with their idle timestamp. We iterate (releasing shard
+        // locks per item) into a Vec rather than mutating during iteration.
+        let mut candidates: Vec<(PeerHandle, std::time::Instant)> = self
+            .states
+            .iter()
+            .filter_map(|e| {
+                let p = e.value();
+                match p.get_state() {
+                    PeerState::Dead | PeerState::NotNeeded => {
+                        Some((*e.key(), p.idle_since.unwrap_or_else(std::time::Instant::now)))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Oldest idle first.
+        candidates.sort_unstable_by_key(|(_, since)| *since);
+
+        let mut evicted = 0;
+        for (handle, _) in candidates.into_iter().take(want) {
+            if self.drop_peer(handle).is_some() {
+                evicted += 1;
+            }
+        }
+        evicted
     }
     pub fn with_peer<R>(&self, addr: PeerHandle, f: impl FnOnce(&Peer) -> R) -> Option<R> {
         self.states.get(&addr).map(|e| f(e.value()))
