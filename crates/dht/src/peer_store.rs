@@ -149,6 +149,14 @@ impl PeerStore {
             addr.set_port(announce.port);
         }
 
+        // If we're at capacity, reclaim stale peers first so the store stays fresh instead
+        // of freezing once full. Must run BEFORE taking the entry guard below: entry()
+        // write-locks a shard and garbage_collect_peers() iterates all shards (deadlock
+        // otherwise).
+        if self.peers_len.load(std::sync::atomic::Ordering::SeqCst) >= self.max_remembered_peers {
+            self.garbage_collect_peers();
+        }
+
         use dashmap::mapref::entry::Entry;
         let peers_entry = self.peers.entry(announce.info_hash);
         let peers_len = self.peers_len.load(std::sync::atomic::Ordering::SeqCst);
@@ -201,8 +209,21 @@ impl PeerStore {
         Vec::new()
     }
 
-    #[allow(dead_code)]
+    /// Evict stored peers older than the TTL and drop info_hashes left with no peers,
+    /// keeping `peers_len` in sync. DHT peers re-announce roughly every ~30 min, so a
+    /// stored peer not refreshed within the TTL is presumed gone.
     pub fn garbage_collect_peers(&self) {
-        todo!()
+        let cutoff = Utc::now() - chrono::Duration::hours(2);
+        let mut removed: u32 = 0;
+        self.peers.retain(|_id, stored| {
+            let before = stored.len();
+            stored.retain(|p| p.time >= cutoff);
+            removed += (before - stored.len()) as u32;
+            !stored.is_empty()
+        });
+        if removed > 0 {
+            self.peers_len
+                .fetch_sub(removed, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
