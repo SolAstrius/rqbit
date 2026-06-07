@@ -8,7 +8,6 @@ use std::{
 
 use anyhow::{Context, bail};
 use fast_socks5::client::Socks5Datagram;
-use fast_socks5::new_udp_header;
 use fast_socks5::util::target_addr::TargetAddr;
 use futures::future::BoxFuture;
 use librqbit_dualstack_sockets::{ConnectOpts, PollSendToVectored};
@@ -269,6 +268,33 @@ const SOCKS_UDP_RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 // Backoff after a failed reassociation attempt, so we don't spin on a down proxy.
 const SOCKS_REASSOCIATE_BACKOFF: Duration = Duration::from_secs(5);
 
+thread_local! {
+    // Reused per-thread scratch buffer for framing outbound SOCKS5-UDP datagrams, so the
+    // hot uTP send path (tens of thousands of packets/sec under churn) doesn't heap-allocate
+    // a fresh header Vec (and a Vec<&[u8]>) on every single packet. ~MTU-sized; retains
+    // capacity across sends.
+    static SOCKS_FRAME_BUF: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(Vec::with_capacity(2048));
+}
+
+// Write the SOCKS5 UDP request header (RFC 1928) for an IP target into `buf`. Matches
+// fast_socks5::new_udp_header byte-for-byte for IPv4/IPv6 (we never frame domain targets):
+// RSV(2)=0, FRAG(1)=0, ATYP (1=IPv4, 4=IPv6), addr octets, port big-endian.
+fn write_socks5_udp_header(buf: &mut Vec<u8>, target: SocketAddr) {
+    buf.extend_from_slice(&[0, 0, 0]);
+    match target {
+        SocketAddr::V4(a) => {
+            buf.push(1);
+            buf.extend_from_slice(&a.ip().octets());
+        }
+        SocketAddr::V6(a) => {
+            buf.push(4);
+            buf.extend_from_slice(&a.ip().octets());
+        }
+    }
+    buf.extend_from_slice(&target.port().to_be_bytes());
+}
+
 fn socks_err_to_io(e: fast_socks5::SocksError) -> std::io::Error {
     std::io::Error::other(e)
 }
@@ -483,7 +509,7 @@ impl tracker_comms::UdpTransport for SocksUdpSocket {
 /// [`SocksUdpSocket`] can't provide. The enabler: the datagram's inner UDP socket
 /// is `connect()`ed to the relay (see `Socks5Datagram::bind_internal`), so
 /// `get_ref()` hands back a connected `tokio::net::UdpSocket` with a real
-/// `poll_send`. We frame manually with `new_udp_header` and keep the datagram
+/// `poll_send`. We frame manually with `write_socks5_udp_header` and keep the datagram
 /// behind a std `RwLock<Arc<..>>` so the sync path reads it without `.await`.
 pub(crate) struct SocksUtpTransport {
     proxy: SocksProxyConfig,
@@ -580,31 +606,34 @@ impl SocksUtpTransport {
     // Frame `parts` (concatenated) for `target` and synchronously poll_send the
     // SOCKS5-UDP-framed datagram to the connected relay socket. On success returns
     // the *payload* length (a datagram send is atomic — all or nothing).
-    fn poll_send_framed(
+    // Frame `target`'s SOCKS5 UDP header plus the payload written by `fill_payload` into the
+    // reused thread-local scratch buffer, then synchronously poll_send the framed datagram to
+    // the connected relay socket. `fill_payload` returns the payload byte count (a datagram
+    // send is atomic — all or nothing). Avoids per-packet heap allocation entirely.
+    fn poll_send_frame_buf(
         &self,
         cx: &mut std::task::Context<'_>,
         target: SocketAddr,
-        parts: &[&[u8]],
+        fill_payload: impl FnOnce(&mut Vec<u8>) -> usize,
     ) -> Poll<std::io::Result<usize>> {
-        let mut frame = match new_udp_header(target) {
-            Ok(h) => h,
-            Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
-        };
-        let mut payload_len = 0usize;
-        for p in parts {
-            frame.extend_from_slice(p);
-            payload_len += p.len();
-        }
-        let dgram = self.current();
-        match dgram.get_ref().poll_send(cx, &frame) {
-            Poll::Ready(Ok(_n)) => {
-                self.sent_since_recv
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                Poll::Ready(Ok(payload_len))
+        SOCKS_FRAME_BUF.with(|cell| {
+            let mut frame = cell.borrow_mut();
+            frame.clear();
+            write_socks5_udp_header(&mut frame, target);
+            let payload_len = fill_payload(&mut frame);
+            let dgram = self.current();
+            // poll_send is non-blocking and never re-enters this thread-local, so holding
+            // the borrow across it is safe.
+            match dgram.get_ref().poll_send(cx, &frame) {
+                Poll::Ready(Ok(_n)) => {
+                    self.sent_since_recv
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    Poll::Ready(Ok(payload_len))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
+        })
     }
 }
 
@@ -615,11 +644,16 @@ impl PollSendToVectored for SocksUtpTransport {
         bufs: &[IoSlice<'_>],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>> {
-        // Coalesce into one framed datagram (the SOCKS header is prepended inside
-        // poll_send_framed). Correct but copies; optimize to a writev to the relay
-        // addr later only if profiles show it hot.
-        let parts: Vec<&[u8]> = bufs.iter().map(|s| &s[..]).collect();
-        self.poll_send_framed(cx, target, &parts)
+        // Coalesce into one framed datagram, writing each slice straight into the reused
+        // scratch buffer (no intermediate Vec<&[u8]>, no per-packet header alloc).
+        self.poll_send_frame_buf(cx, target, |frame| {
+            let mut n = 0;
+            for b in bufs {
+                frame.extend_from_slice(b);
+                n += b.len();
+            }
+            n
+        })
     }
 }
 
@@ -698,7 +732,10 @@ impl Transport for SocksUtpTransport {
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>> {
-        self.poll_send_framed(cx, target, &[buf])
+        self.poll_send_frame_buf(cx, target, |frame| {
+            frame.extend_from_slice(buf);
+            buf.len()
+        })
     }
 
     fn bind_addr(&self) -> SocketAddr {
@@ -1022,6 +1059,25 @@ impl StreamConnector {
                     }
                 },
             };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_socks5_udp_header;
+    use std::net::SocketAddr;
+
+    // Guards the hand-written SOCKS5 UDP header against fast_socks5's encoder, since the
+    // hot send path no longer calls new_udp_header and no e2e test exercises SOCKS framing.
+    #[test]
+    fn socks5_udp_header_matches_fast_socks5() {
+        for s in ["1.2.3.4:6881", "[2001:db8::1]:51413"] {
+            let addr: SocketAddr = s.parse().unwrap();
+            let mut buf = Vec::new();
+            write_socks5_udp_header(&mut buf, addr);
+            let expected = fast_socks5::new_udp_header(addr).unwrap();
+            assert_eq!(buf, expected, "header mismatch for {addr}");
         }
     }
 }
