@@ -749,6 +749,39 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         client_name_and_version: None,
     };
 
+    // Install the prometheus recorder early, before any metrics are registered.
+    #[cfg(feature = "prometheus")]
+    let prometheus_handle = match metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+    {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            warn!("error installing prometheus recorder: {e:#}");
+            None
+        }
+    };
+
+    // metrics-exporter-prometheus only drains its histogram sample buffers
+    // (metrics_util::AtomicBucket) when the recorder renders, i.e. on a /metrics
+    // scrape. install_recorder() spawns no upkeep thread, so with high-frequency
+    // histograms (e.g. the per-packet uTP rtt/payload metrics) and no scraper those
+    // buffers grow without bound and leak memory (~10 MiB/min in production). Drain
+    // them on a timer so memory stays bounded regardless of whether anyone scrapes.
+    #[cfg(feature = "prometheus")]
+    if let Some(handle) = prometheus_handle.clone() {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => handle.run_upkeep(),
+                }
+            }
+        });
+    }
+
     #[allow(clippy::needless_update)]
     let mut http_api_opts = HttpApiOptions {
         read_only: true,
@@ -762,17 +795,8 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         },
         allow_create: opts.http_api_allow_create,
 
-        // We need to install prometheus recorder early before we registered any metrics.
         #[cfg(feature = "prometheus")]
-        prometheus_handle: match metrics_exporter_prometheus::PrometheusBuilder::new()
-            .install_recorder()
-        {
-            Ok(handle) => Some(handle),
-            Err(e) => {
-                warn!("error installing prometheus recorder: {e:#}");
-                None
-            }
-        },
+        prometheus_handle,
 
         ..Default::default()
     };
