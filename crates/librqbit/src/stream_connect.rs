@@ -676,7 +676,16 @@ impl Transport for SocksUtpTransport {
                     Ok(n)
                 }
                 Err(e) => {
-                    self.reassociate("send error").await;
+                    // Do NOT await reassociate() here. This send_to runs on the uTP
+                    // dispatcher's single task; reassociate() can sleep up to
+                    // SOCKS_REASSOCIATE_BACKOFF (5s) on a failed rebind, which stalls the
+                    // dispatcher and lets its unbounded control channel back up under
+                    // connection churn (each queued request pins a tracing span) — a
+                    // sustained, churn-correlated memory leak. Just flag the failed send;
+                    // the recv supervisor (a separate task) reassociates on its next
+                    // idle/error tick, off the dispatcher's critical path.
+                    self.sent_since_recv
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     Err(socks_err_to_io(e))
                 }
             }
