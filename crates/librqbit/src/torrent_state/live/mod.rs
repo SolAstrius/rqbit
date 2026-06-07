@@ -1320,6 +1320,11 @@ impl PeerHandler {
     fn on_peer_died(self, error: Option<crate::Error>) -> crate::Result<()> {
         let peers = &self.state.peers;
         let handle = self.addr;
+        // If this addr was a ut_holepunch dial that never went live, clear its marker now.
+        // Otherwise failed punch dials (the common case behind the VPN/relay) would
+        // accumulate in holepunch_dials forever, since set_peer_live is the only other
+        // remover. A confirmed punch removes it there first, so this never double-counts.
+        self.state.holepunch_dials.remove(&handle);
         let mut pe = match peers.states.get_mut(&handle) {
             Some(peer) => TimedExistence::new(peer, "on_peer_died"),
             None => {
@@ -2121,16 +2126,21 @@ impl PeerHandler {
                     .counters
                     .holepunch_connects
                     .fetch_add(1, Ordering::Relaxed);
-                // Mark this dial so we can count it as a confirmed punch if it goes live.
-                self.state.holepunch_dials.insert(target);
-                if let Err(error) = self.state.add_peer_if_not_seen_with_connect_timeout(
+                match self.state.add_peer_if_not_seen_with_connect_timeout(
                     target,
                     Some(HOLEPUNCH_CONNECT_TIMEOUT),
                 ) {
-                    debug!(
+                    // Only mark a freshly-queued dial as a punch target. If the peer was
+                    // already known there is no new dial, and an unconditional insert would
+                    // leave a marker that set_peer_live/on_peer_died never clears.
+                    Ok(true) => {
+                        self.state.holepunch_dials.insert(target);
+                    }
+                    Ok(false) => {}
+                    Err(error) => debug!(
                         ?target,
                         "ut_holepunch: failed to queue connect-back: {error:#}"
-                    );
+                    ),
                 }
             }
             UtHolepunch::Rendezvous(target) => {
