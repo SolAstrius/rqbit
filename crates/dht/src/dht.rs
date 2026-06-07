@@ -626,31 +626,44 @@ impl DhtState {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.inflight_by_transaction_id
             .insert(key, OutstandingRequest { done: tx });
-        trace!("sending {message:?}");
-        match self.worker_sender.send(WorkerSendRequest {
-            our_tid: Some(tid),
-            message,
-            addr,
-        }) {
-            Ok(_) => {}
-            Err(_) => {
-                self.inflight_by_transaction_id.remove(&key);
-                return Err(Error::DhtDead);
+
+        // Ensure the inflight entry is removed on EVERY exit path, including this future
+        // being cancelled (dropped) mid-await — otherwise a cancelled request leaks its
+        // entry until the u16 transaction id wraps around. Idempotent with the removal the
+        // response handler does on success.
+        struct RemoveOnDrop<'a> {
+            map: &'a DashMap<(u16, SocketAddr), OutstandingRequest>,
+            key: (u16, SocketAddr),
+        }
+        impl Drop for RemoveOnDrop<'_> {
+            fn drop(&mut self) {
+                self.map.remove(&self.key);
             }
+        }
+        let _guard = RemoveOnDrop {
+            map: &self.inflight_by_transaction_id,
+            key,
         };
+
+        trace!("sending {message:?}");
+        if self
+            .worker_sender
+            .send(WorkerSendRequest {
+                our_tid: Some(tid),
+                message,
+                addr,
+            })
+            .is_err()
+        {
+            return Err(Error::DhtDead);
+        }
         match tokio::time::timeout(RESPONSE_TIMEOUT, rx).await {
             Ok(Ok(r)) => r.map(|r| {
                 trace!("received {r:?}");
                 r
             }),
-            Ok(Err(_)) => {
-                self.inflight_by_transaction_id.remove(&key);
-                Err(Error::DhtDead)
-            }
-            Err(_) => {
-                self.inflight_by_transaction_id.remove(&key);
-                Err(Error::ResponseTimeout(RESPONSE_TIMEOUT))
-            }
+            Ok(Err(_)) => Err(Error::DhtDead),
+            Err(_) => Err(Error::ResponseTimeout(RESPONSE_TIMEOUT)),
         }
     }
 
