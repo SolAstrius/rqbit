@@ -1,0 +1,45 @@
+# Throwaway glibc image for jemalloc heap profiling (NOT for production).
+# Built non-static on glibc so jemalloc --enable-prof produces usable backtraces
+# and the binary keeps symbols for jeprof. Minimal feature set (rust-tls, no
+# webui/openssl/postgres) to keep the diagnostic build fast.
+#
+# Run with MALLOC_CONF, e.g.:
+#   prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:27,prof_prefix:/profiles/jeprof
+# which auto-dumps a heap profile every ~128MiB of allocation growth into /profiles.
+FROM rust:bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang make cmake libc6-dev && rm -rf /var/lib/apt/lists/*
+
+COPY / /src/
+WORKDIR /src/
+
+RUN --mount=type=cache,target=/usr/local/cargo/git/db \
+    --mount=type=cache,target=/usr/local/cargo/registry/cache \
+    --mount=type=cache,target=/usr/local/cargo/registry/index \
+    --mount=type=cache,target=/src/target <<EOF
+set -e
+cargo build -p rqbit \
+    --no-default-features \
+    --features "rust-tls,prometheus,jemalloc-prof" \
+    --profile release-debug
+cp /src/target/release-debug/rqbit /bin/rqbit
+EOF
+
+FROM debian:bookworm-slim
+# ca-certificates for TLS; tar so `kubectl cp` can extract profiles + the binary.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates tar && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /bin/rqbit /bin/rqbit
+
+WORKDIR /home/rqbit
+ENV HOME=/home/rqbit
+ENV XDG_DATA_HOME=/home/rqbit/db
+ENV XDG_CACHE_HOME=/home/rqbit/cache
+ENV RQBIT_HTTP_API_LISTEN_ADDR=0.0.0.0:3030
+ENV RQBIT_LISTEN_PORT=4240
+
+EXPOSE 3030
+EXPOSE 4240
+CMD ["server", "start", "/home/rqbit/downloads"]
+ENTRYPOINT ["/bin/rqbit"]

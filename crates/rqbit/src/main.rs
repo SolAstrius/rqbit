@@ -530,6 +530,12 @@ fn api_socket_from_systemd() -> anyhow::Result<Option<TcpListener>> {
 #[global_allocator]
 static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
 
+// jemalloc with sampling heap profiler. Enabled via MALLOC_CONF at runtime
+// (e.g. prof:true,lg_prof_sample:19,lg_prof_interval:27,prof_prefix:/profiles/jeprof).
+#[cfg(all(feature = "jemalloc-prof", not(feature = "dhat-heap")))]
+#[global_allocator]
+static JEMALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> anyhow::Result<()> {
     // Explicitly dropped after block_on (main ends in std::process::exit, which
     // runs no destructors) to write dhat-heap.json while the session is still live.

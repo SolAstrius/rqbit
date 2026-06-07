@@ -25,6 +25,9 @@ postgres = ["librqbit/postgres"]
 disable-upload = ["librqbit/disable-upload"]
 # Heap-profile the binary with dhat (writes dhat-heap.json on clean exit). Dev-only.
 dhat-heap = ["dep:dhat"]
+# Heap-profile with jemalloc sampling profiler (low overhead, dumps live via
+# MALLOC_CONF lg_prof_interval). Diagnostic-only; build on glibc for usable backtraces.
+jemalloc-prof = ["dep:tikv-jemallocator"]
 _disable_disk_write_net_benchmark = [
     "librqbit/_disable_disk_write_net_benchmark",
 ]
@@ -40,6 +43,10 @@ librqbit = { workspace = true, features = [
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 console-subscriber = { workspace = true, optional = true }
 dhat = { version = "0.3", optional = true }
+tikv-jemallocator = { version = "0.6", features = [
+    "profiling",
+    "unprefixed_malloc_on_supported_platforms",
+], optional = true }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive", "deprecated", "env"] }
 clap_complete.workspace = true
