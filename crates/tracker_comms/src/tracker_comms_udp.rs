@@ -352,7 +352,12 @@ impl UdpTrackerClient {
         let response = self.request(addr, Request::Connect).await?;
         match response {
             Response::Connect(connection_id) => {
-                self.state.locked.write().connections.insert(
+                let mut g = self.state.locked.write();
+                // Drop expired connection-ids so the map can't grow unbounded with
+                // one-shot trackers (each entry is only reused within 60s anyway).
+                g.connections
+                    .retain(|_, m| m.created.elapsed() < Duration::from_secs(60));
+                g.connections.insert(
                     addr,
                     ConnectionIdMeta {
                         id: connection_id,
