@@ -13,10 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY / /src/
 WORKDIR /src/
 
-# jemalloc's prof backtrace uses the frame-pointer unwinder (no libunwind in this
-# build image). Rust's release profile omits frame pointers, which truncates every
-# allocation stack at prof_backtrace_impl. Force frame pointers so jemalloc can walk
-# up into the Rust frames and produce usable backtraces.
+# jemalloc's prof backtrace uses libgcc _Unwind_Backtrace (DWARF). For it to walk OUT
+# of the allocator's own C frames into the Rust caller, jemalloc's C code must carry
+# async unwind tables (.eh_frame CFI). Force them (+frame pointers as belt-and-braces)
+# on both the jemalloc C build (CFLAGS, honored by cc->configure) and Rust (RUSTFLAGS),
+# otherwise allocation stacks truncate at prof_backtrace_impl.
+ENV CFLAGS="-fno-omit-frame-pointer -fasynchronous-unwind-tables"
 ENV RUSTFLAGS="-C force-frame-pointers=yes"
 
 RUN --mount=type=cache,target=/usr/local/cargo/git/db \
