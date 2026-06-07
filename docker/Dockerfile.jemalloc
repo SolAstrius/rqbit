@@ -13,6 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY / /src/
 WORKDIR /src/
 
+# jemalloc's prof backtrace uses the frame-pointer unwinder (no libunwind in this
+# build image). Rust's release profile omits frame pointers, which truncates every
+# allocation stack at prof_backtrace_impl. Force frame pointers so jemalloc can walk
+# up into the Rust frames and produce usable backtraces.
+ENV RUSTFLAGS="-C force-frame-pointers=yes"
+
 RUN --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/cache \
     --mount=type=cache,target=/usr/local/cargo/registry/index \
