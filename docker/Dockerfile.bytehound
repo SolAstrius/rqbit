@@ -1,0 +1,51 @@
+# Throwaway glibc image for bytehound heap profiling (NOT for production).
+# Built WITHOUT jemalloc so bytehound's LD_PRELOAD malloc interposition works, on
+# glibc with debug symbols + frame pointers for high-quality async-Rust backtraces.
+# Cull short-lived allocations so the trace isolates leaked (long-lived) allocations.
+FROM rust:bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang make cmake libc6-dev && rm -rf /var/lib/apt/lists/*
+
+COPY / /src/
+WORKDIR /src/
+
+ENV RUSTFLAGS="-C force-frame-pointers=yes"
+
+RUN --mount=type=cache,target=/usr/local/cargo/git/db \
+    --mount=type=cache,target=/usr/local/cargo/registry/cache \
+    --mount=type=cache,target=/usr/local/cargo/registry/index \
+    --mount=type=cache,target=/src/target <<EOF
+set -e
+cargo build -p rqbit \
+    --no-default-features \
+    --features "rust-tls,prometheus" \
+    --profile release-debug
+cp /src/target/release-debug/rqbit /bin/rqbit
+EOF
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates tar && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /bin/rqbit /bin/rqbit
+COPY docker/libbytehound.so /libbytehound.so
+
+WORKDIR /home/rqbit
+ENV HOME=/home/rqbit
+ENV XDG_DATA_HOME=/home/rqbit/db
+ENV XDG_CACHE_HOME=/home/rqbit/cache
+ENV RQBIT_HTTP_API_LISTEN_ADDR=0.0.0.0:3030
+ENV RQBIT_LISTEN_PORT=4240
+
+# bytehound config: preload the profiler, write to the shared volume, and cull
+# short-lived allocations (lifetime < threshold ms) so only leaks remain.
+ENV LD_PRELOAD=/libbytehound.so
+ENV MEMORY_PROFILER_OUTPUT=/profiles/profile.dat
+ENV MEMORY_PROFILER_LOG=warn
+ENV MEMORY_PROFILER_CULL_TEMPORARY_ALLOCATIONS=1
+ENV MEMORY_PROFILER_TEMPORARY_ALLOCATION_LIFETIME_THRESHOLD=20000
+
+EXPOSE 3030
+EXPOSE 4240
+CMD ["server", "start", "/home/rqbit/downloads"]
+ENTRYPOINT ["/bin/rqbit"]
