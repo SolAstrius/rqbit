@@ -1,10 +1,14 @@
 # Throwaway glibc image for bytehound heap profiling (NOT for production).
 # Built WITHOUT jemalloc so bytehound's LD_PRELOAD malloc interposition works, on
 # glibc with debug symbols + frame pointers for high-quality async-Rust backtraces.
-# Cull short-lived allocations so the trace isolates leaked (long-lived) allocations.
+# Uses FULL default features (webui, default-tls, postgres, prometheus) so it matches
+# the production image exactly. Cull short-lived allocations so the trace isolates
+# leaked (long-lived) allocations.
 FROM rust:bookworm AS builder
+# clang/make/cmake/libc6-dev: C deps; perl: vendored openssl (default-tls);
+# nodejs/npm: webui build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        clang make cmake libc6-dev && rm -rf /var/lib/apt/lists/*
+        clang make cmake libc6-dev perl nodejs npm && rm -rf /var/lib/apt/lists/*
 
 COPY / /src/
 WORKDIR /src/
@@ -17,8 +21,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/src/target <<EOF
 set -e
 cargo build -p rqbit \
-    --no-default-features \
-    --features "rust-tls,prometheus" \
     --profile release-debug
 cp /src/target/release-debug/rqbit /bin/rqbit
 EOF
