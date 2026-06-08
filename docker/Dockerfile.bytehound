@@ -5,10 +5,14 @@
 # the production image exactly. Cull short-lived allocations so the trace isolates
 # leaked (long-lived) allocations.
 FROM rust:bookworm AS builder
-# clang/make/cmake/libc6-dev: C deps; perl: vendored openssl (default-tls);
-# nodejs/npm: webui build.
+# clang/make/cmake/libc6-dev: C deps; perl: vendored openssl (default-tls).
+# Node 20 from nodesource (bookworm's Node 18 + old npm hit the rollup 4 native
+# binding bug: https://github.com/npm/cli/issues/4828).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        clang make cmake libc6-dev perl nodejs npm && rm -rf /var/lib/apt/lists/*
+        clang make cmake libc6-dev perl curl ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY / /src/
 WORKDIR /src/
@@ -20,6 +24,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/index \
     --mount=type=cache,target=/src/target <<EOF
 set -e
+# Clear stale (cross-platform / musl) npm lockfiles + modules so build.rs's
+# "npm install" regenerates the correct glibc rollup native binding. The webui is
+# an npm workspace, so the lockfile lives at the repo root.
+find /src -name package-lock.json -delete
+find /src -name node_modules -type d -prune -exec rm -rf {} +
 cargo build -p rqbit \
     --profile release-debug
 cp /src/target/release-debug/rqbit /bin/rqbit
