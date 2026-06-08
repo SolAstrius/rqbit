@@ -186,6 +186,14 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksFindNodes {
     }
 }
 
+/// Caps the number of concurrent in-flight recursive requests in
+/// `request_peers_forever`. Without a bound, `request_one` feeds newly-discovered
+/// nodes back into the queue faster than they complete, so the `FuturesUnordered`
+/// (each task node ~952 bytes) grows without bound for the lifetime of the
+/// forever-running query — ~10 MiB/min across hundreds of torrents. DHT peer
+/// discovery is best-effort, so dropping excess nodes once saturated is fine.
+const MAX_CONCURRENT_GET_PEERS_REQUESTS: usize = 32;
+
 struct RecursiveRequest<C: RecursiveRequestCallbacks> {
     max_depth: usize,
     useful_nodes_limit: usize,
@@ -375,11 +383,17 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                     tokio::select! {
                         addr = node_rx.recv() => {
                             let (id, addr, depth) = addr.unwrap();
-                            futs.push(
-                                this.request_one(id, addr, depth)
-                                    .map_err(|e| debug!("error: {e:#}"))
-                                    .instrument(debug_span!("addr", addr=addr.to_string()))
-                            );
+                            // Always drain node_rx (so the channel can't grow unbounded
+                            // either), but only spawn a request while under the in-flight
+                            // cap; otherwise drop this node. See
+                            // MAX_CONCURRENT_GET_PEERS_REQUESTS.
+                            if futs.len() < MAX_CONCURRENT_GET_PEERS_REQUESTS {
+                                futs.push(
+                                    this.request_one(id, addr, depth)
+                                        .map_err(|e| debug!("error: {e:#}"))
+                                        .instrument(debug_span!("addr", addr=addr.to_string()))
+                                );
+                            }
                         }
                         Some(_) = futs.next(), if !futs.is_empty() => {}
                         r = &mut looper => {
